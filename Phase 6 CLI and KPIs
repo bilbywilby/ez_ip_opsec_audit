@@ -1,0 +1,1284 @@
+
+
+### File 7: `.github/workflows/ci-cd.yml` (GitHub Actions Pipeline)
+
+```yaml
+# .github/workflows/ci-cd.yml
+name: Security Audit Platform - CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly scan every Monday at 6 AM
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/security-audit-platform
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # -------------------------------------------------------------------
+  # CODE QUALITY & SECURITY SCAN
+  # -------------------------------------------------------------------
+  lint-security:
+    name: 🔒 Lint & Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black mypy bandit safety
+          
+      - name: Lint with flake8
+        run: |
+          flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=127
+        
+      - name: Black format check
+        run: |
+          black --check --diff src/
+          
+      - name: Type checking with mypy
+        run: |
+          mypy src/ --ignore-missing-imports --no-error-summary || true
+      
+      - name: Bandit security scan
+        run: |
+          bandit -r src/ -f json -o bandit-results.json || true
+        
+      - name: Upload security scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results
+          path: bandit-results.json
+          retention-days: 90
+  
+  # -------------------------------------------------------------------
+  # DEPENDENCY VULNERABILITY SCANNING
+  # -------------------------------------------------------------------
+  dependency-scan:
+    name: 📦 Dependency Vulnerability Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      
+      - name: Safety vulnerability check
+        run: |
+          safety check -r requirements.txt --json > safety-report.json || true
+      
+      - name: Upload dependency report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-vulnerabilities
+          path: safety-report.json
+  
+  # -------------------------------------------------------------------
+  # UNIT & INTEGRATION TESTS
+  # -------------------------------------------------------------------
+  test:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+    needs: [lint-security, dependency-scan]
+    timeout-minutes: 30
+    
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      
+      - name: Install test dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-xdist Faker
+      
+      - name: Run unit tests with coverage
+        run: |
+          pytest src/tests/unit \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=html \
+            -v
+      
+      - name: Run integration tests
+        run: |
+          pytest src/tests/integration \
+            -v \
+            --junitxml=junit-results.xml
+      
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-${{ matrix.python-version }}
+      
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: junit-results.xml
+  
+  # -------------------------------------------------------------------
+  # BUILD & PUSH DOCKER IMAGES
+  # -------------------------------------------------------------------
+  build:
+    name: 🐳 Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: github.event_name != 'pull_request'
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Build dashboard image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/dashboard
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dashboard-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+  
+  # -------------------------------------------------------------------
+  # DEPLOYMENT (Production)
+  # -------------------------------------------------------------------
+  deploy-staging:
+    name: 🚀 Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/develop'
+    
+    environment:
+      name: staging
+      url: https://staging.security-audit.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to staging via SSH
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            cd /opt/security-audit
+            git pull origin develop
+            docker-compose pull
+            docker-compose up -d
+            docker-compose logs -f dashboard scheduler
+  
+  deploy-production:
+    name: 🚀 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    environment:
+      name: production
+      url: https://security-audit.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run pre-deployment health checks
+        run: |
+          curl -f https://staging.security-audit.example.com/api/health || exit 1
+      
+      - name: Deploy to production via SSH
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            cd /opt/security-audit
+            git checkout main
+            git pull origin main
+            docker-compose pull
+            docker-compose up -d
+            docker-compose logs -f dashboard scheduler
+    
+      - name: Post-deployment smoke tests
+        run: |
+          sleep 30
+          curl -f https://security-audit.example.com/api/status || exit 1
+  
+  notify:
+    name: 📢 Notify Team
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          text: "Deployment ${needs.deploy-production.result} for commit ${{ github.sha }}"
+```
+
+---
+
+### File 8: `docker/Dockerfile.prod` (Production Docker Configuration)
+
+```dockerfile
+# Multi-stage build for minimized production image
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+RUN pip wheel --wheel-dir /wheels -r requirements.txt
+
+# -------------------------------------------------------------------
+# PRODUCTION IMAGE
+# -------------------------------------------------------------------
+FROM python:3.11-slim AS production
+
+# Create non-root user for security
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+WORKDIR /app
+
+# Copy wheels from builder
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
+
+# Copy application code
+COPY src/ ./src/
+COPY nginx.conf /etc/nginx/nginx.conf
+
+# Create log directories
+RUN mkdir -p /var/log/security-audit /var/log/dashboard && chown -R appuser:appuser /var/log
+
+# Switch to non-root user
+USER appuser
+
+# Expose port
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/api/health || exit 1
+
+# Entry point
+ENTRYPOINT ["bash", "-c"]
+CMD ["gunicorn --bind 0.0.0.0:5000 --workers 4 --worker-class gevent --access-logfile - --error-logfile - src.dashboard.app:app"]
+```
+
+---
+
+### File 9: `src/monitoring/metrics.py` (Prometheus Metrics Integration)
+
+```python
+#!/usr/bin/env python3
+"""
+Prometheus metrics collection for monitoring
+"""
+
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CollectorRegistry
+from flask import Response
+from functools import wraps
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+# -------------------------------------------------------------------
+# METRIC DEFINITIONS
+# -------------------------------------------------------------------
+# Counters (cumulative, never decrease)
+AUDIT_RUN_COUNT = Counter(
+    'security_audit_runs_total',
+    'Total number of security audit executions',
+    ['status']  # success, failure
+)
+
+FINDINGS_COUNT = Counter(
+    'security_audit_findings_total',
+    'Total security findings detected',
+    ['severity', 'type']
+)
+
+API_REQUEST_COUNT = Counter(
+    'dashboard_api_requests_total',
+    'Total API requests to dashboard',
+    ['endpoint', 'method', 'status_code']
+)
+
+NOTIFICATION_SENT = Counter(
+    'alerts_notifications_sent_total',
+    'Total notifications sent',
+    ['channel', 'severity', 'status']
+)
+
+# Gauges (current state, can increase/decrease)
+ACTIVE_AUDITS_GAUGE = Gauge(
+    'security_active_audits',
+    'Currently running audit jobs'
+)
+
+OPEN_CRITICAL_FINDINGS = Gauge(
+    'security_open_critical_findings',
+    'Number of unresolved critical findings'
+)
+
+DATABASE_CONNECTIONS = Gauge(
+    'database_connections_current',
+    'Active database connections'
+)
+
+# Histograms (distribution measurements)
+AUDIT_DURATION_HISTOGRAM = Histogram(
+    'security_audit_duration_seconds',
+    'Duration of security audit runs',
+    buckets=(10, 30, 60, 120, 300, 600, float('inf'))
+)
+
+API_RESPONSE_TIME_HISTOGRAM = Histogram(
+    'dashboard_api_response_time_seconds',
+    'Dashboard API response times',
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, float('inf'))
+)
+
+ERROR_RATE_GAUGE = Gauge(
+    'system_error_rate_percentage',
+    'Current error rate percentage',
+    ['component']
+)
+
+# -------------------------------------------------------------------
+# DECORATORS
+# -------------------------------------------------------------------
+def track_audit_runtime(f):
+    """Track audit execution time"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        ACTIVE_AUDITS_GAUGE.inc()
+        start_time = time.time()
+        
+        try:
+            result = f(*args, **kwargs)
+            AUDIT_RUN_COUNT.labels(status='success').inc()
+            return result
+        except Exception as e:
+            AUDIT_RUN_COUNT.labels(status='failure').inc()
+            raise
+        finally:
+            duration = time.time() - start_time
+            AUDIT_DURATION_HISTOGRAM.observe(duration)
+            ACTIVE_AUDITS_GAUGE.dec()
+    
+    return wrapper
+
+def track_api_metrics(endpoint_name):
+    """Track API endpoint metrics"""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            start_time = time.time()
+            
+            try:
+                response = f(*args, **kwargs)
+                status_code = response.status_code if hasattr(response, 'status_code') else 200
+            except Exception:
+                status_code = 500
+            
+            API_REQUEST_COUNT.labels(
+                endpoint=endpoint_name,
+                method='GET' if hasattr(f, '_method') else 'POST',
+                status_code=status_code
+            ).inc()
+            
+            duration = time.time() - start_time
+            API_RESPONSE_TIME_HISTOGRAM.observe(duration)
+            
+            return response
+        
+        return wrapper
+    return decorator
+
+# -------------------------------------------------------------------
+# PROMETHEUS ENDPOINT
+# -------------------------------------------------------------------
+def metrics_endpoint():
+    """Expose metrics for Prometheus scraping"""
+    return Response(generate_latest(), mimetype='text/plain')
+
+# -------------------------------------------------------------------
+# HEALTH CHECK
+# -------------------------------------------------------------------
+class HealthChecker:
+    """Application health monitoring"""
+    
+    def __init__(self):
+        self.checks = []
+    
+    def register_check(self, name: str, check_func):
+        """Register a health check"""
+        self.checks.append((name, check_func))
+    
+    def check_all(self) -> dict:
+        """Run all health checks"""
+        results = {}
+        overall_healthy = True
+        
+        for name, check_func in self.checks:
+            try:
+                healthy = check_func()
+                results[name] = {
+                    'status': 'healthy' if healthy else 'unhealthy',
+                    'timestamp': time.time()
+                }
+                if not healthy:
+                    overall_healthy = False
+            except Exception as e:
+                results[name] = {
+                    'status': 'error',
+                    'error': str(e),
+                    'timestamp': time.time()
+                }
+                overall_healthy = False
+        
+        return {
+            'overall': 'healthy' if overall_healthy else 'unhealthy',
+            'checks': results
+        }
+
+# Global instances
+health_checker = HealthChecker()
+registry = CollectorRegistry()
+
+# Register default checks
+def check_database():
+    import sqlite3
+    try:
+        conn = sqlite3.connect('/tmp/security_audit.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        conn.close()
+        return True
+    except:
+        return False
+
+def check_redis():
+    import redis
+    try:
+        r = redis.Redis(host='localhost', port=6379)
+        r.ping()
+        return True
+    except:
+        return False
+
+health_checker.register_check('database', check_database)
+health_checker.register_check('cache', check_redis)
+```
+
+---
+
+### File 10: `grafana/dashboards/security-monitoring.json` (Grafana Dashboard)
+
+```json
+{
+  "annotations": {
+    "list": [{"builtIn": 1, "datasource": "-- Grafana --", "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "title": "Audit Overview",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 1},
+      "id": 2,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "pluginVersion": "9.0.0",
+      "targets": [
+        {
+          "expr": "security_active_audits",
+          "legendFormat": "Active Audits",
+          "refId": "A"
+        }
+      ],
+      "title": "Active Audit Jobs",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "#EAB839", "value": 1},
+              {"color": "red", "value": 5}
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 8, "w": 6, "x": 6, "y": 1},
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "security_open_critical_findings",
+          "legendFormat": "Critical",
+          "refId": "A"
+        }
+      ],
+      "title": "Open Critical Findings",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "series",
+            "axisLabel": "",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {"legend": false, "tooltip": false, "viz": false},
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {"type": "linear"},
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {"group": "A", "mode": "none"},
+            "thresholdsStyle": {"mode": "off"}
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 1},
+      "id": 4,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}
+      },
+      "targets": [
+        {
+          "expr": "increase(security_audit_findings_total[1h])",
+          "legendFormat": "{{severity}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Findings Detected Per Hour",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 9},
+      "id": 5,
+      "title": "Performance Metrics",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "series",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "spanNulls": false
+          },
+          "mappings": [],
+          "unit": "s"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 10},
+      "id": 6,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(security_audit_duration_seconds_bucket[5m]))",
+          "legendFormat": "P95 Audit Duration",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, rate(security_audit_duration_seconds_bucket[5m]))",
+          "legendFormat": "P50 Audit Duration",
+          "refId": "B"
+        }
+      ],
+      "title": "Audit Execution Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line"},
+          "mappings": [],
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 10},
+      "id": 7,
+      "targets": [
+        {
+          "expr": "rate(dashboard_api_response_time_seconds_sum[5m]) / rate(dashboard_api_response_time_seconds_count[5m])",
+          "legendFormat": "Avg Response Time",
+          "refId": "A"
+        }
+      ],
+      "title": "API Response Time (Average)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 18},
+      "id": 8,
+      "title": "System Health",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 12, "x": 0, "y": 19},
+      "id": 9,
+      "targets": [
+        {
+          "expr": "system_error_rate_percentage",
+          "legendFormat": "{{component}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Error Rate by Component",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 12, "x": 12, "y": 19},
+      "id": 10,
+      "targets": [
+        {
+          "expr": "increase(alerts_notifications_sent_total[24h])",
+          "legendFormat": "{{channel}} - {{severity}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Notifications Sent (24h)",
+      "type": "bargauge"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["security", "audit", "monitoring"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Security Audit Platform - Monitoring",
+  "uid": "security-audit-monitoring",
+  "version": 1,
+  "weekStart": ""
+}
+```
+
+---
+
+### File 11: `src/logging/logger_config.py` (Structured Logging)
+
+```python
+#!/usr/bin/env python3
+"""
+Structured JSON logging with log rotation
+"""
+
+import logging
+import json
+from datetime import datetime
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
+import sys
+
+class JsonFormatter(logging.Formatter):
+    """Custom JSON formatter for structured logs"""
+    
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'level': record.levelname,
+            'logger': record.name,
+            'message': record.getMessage(),
+            'module': record.module,
+            'function': record.funcName,
+            'line': record.lineno
+        }
+        
+        # Add extra fields if present
+        if hasattr(record, 'extra_fields'):
+            log_entry.update(record.extra_fields)
+        
+        # Include exception info if present
+        if record.exc_info:
+            log_entry['exception'] = self.formatException(record.exc_info)
+        
+        return json.dumps(log_entry)
+
+def setup_logging(
+    log_level: str = 'INFO',
+    log_dir: str = '/var/log/security-audit',
+    max_bytes: int = 100 * 1024 * 1024,  # 100MB
+    backup_count: int = 5
+) -> None:
+    """Configure centralized logging"""
+    
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Root logger configuration
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, log_level.upper()))
+    
+    # Console handler (for container stdout/stderr)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(JsonFormatter())
+    root_logger.addHandler(console_handler)
+    
+    # File handler with rotation
+    file_path = Path(log_dir) / 'application.log'
+    file_handler = RotatingFileHandler(
+        str(file_path),
+        maxBytes=max_bytes,
+        backupCount=backup_count
+    )
+    file_handler.setFormatter(JsonFormatter())
+    root_logger.addHandler(file_handler)
+    
+    # Separate audit-specific log
+    audit_logger = logging.getLogger('audit')
+    audit_logger.propagate = False
+    
+    audit_file_path = Path(log_dir) / 'audit.log'
+    audit_handler = RotatingFileHandler(
+        str(audit_file_path),
+        maxBytes=max_bytes,
+        backupCount=backup_count
+    )
+    audit_handler.setFormatter(JsonFormatter())
+    audit_logger.addHandler(audit_handler)
+    
+    # Error-only log
+    error_handler = RotatingFileHandler(
+        str(Path(log_dir) / 'errors.log'),
+        maxBytes=max_bytes,
+        backupCount=backup_count
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(JsonFormatter())
+    root_logger.addHandler(error_handler)
+    
+    return root_logger
+
+# Structured logging helper
+def audit_log(message: str, **extra_fields):
+    """Helper for structured audit logging"""
+    audit_logger = logging.getLogger('audit')
+    
+    class ExtraRecord(logging.LogRecord):
+        def __init__(self, msg, **extras):
+            super().__init__('dummy', 0, '', 0, msg, (), None)
+            self.extra_fields = extras
+    
+    record = ExtraRecord(message, **extra_fields)
+    audit_logger.info('', extra={'extra_fields': extra_fields})
+
+# Global instance
+setup_logging()
+```
+
+---
+
+### File 12: `prometheus/prometheus.yml` (Prometheus Configuration)
+
+```yaml
+# prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'security-audit-monitor'
+    environment: 'production'
+
+scrape_configs:
+  - job_name: 'dashboard'
+    static_configs:
+      - targets: ['dashboard:5000']
+    metrics_path: /metrics
+    scrape_interval: 10s
+    
+  - job_name: 'scheduler'
+    static_configs:
+      - targets: ['scheduler:8000']
+    metrics_path: /metrics
+    
+  - job_name: 'audit-runner'
+    static_configs:
+      - targets: ['audit-runner:8001']
+      
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['host:9100']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '(.+):.+'
+        replacement: '${1}'
+
+rule_files:
+  - 'alert_rules.yml'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+```
+
+---
+
+### File 13: `prometheus/alert_rules.yml` (Alert Rules)
+
+```yaml
+# prometheus/alert_rules.yml
+groups:
+  - name: security-audit-alerts
+    rules:
+      # Critical findings threshold
+      - alert: CriticalFindingsDetected
+        expr: security_open_critical_findings > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical security findings require immediate attention"
+          description: "{{ $value }} critical findings detected in last audit"
+          
+      # High error rate
+      - alert: HighErrorRate
+        expr: rate(dashboard_api_requests_total{status_code=~"5.."}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API error rate detected"
+          description: "Error rate is {{ $value | humanizePercentage }} over last 5 minutes"
+          
+      # Audit job failures
+      - alert: AuditJobFailure
+        expr: rate(security_audit_runs_total{status="failure"}[1h]) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit job continuously failing"
+          description: "Audit failures detected: {{ $value }} per minute"
+          
+      # Slow audit execution
+      - alert: AuditExecutionSlow
+        expr: histogram_quantile(0.95, rate(security_audit_duration_seconds_bucket[1h])) > 600
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit execution taking unusually long"
+          description: "P95 audit duration is {{ $value }} seconds"
+          
+      # Low disk space (affects log storage)
+      - alert: LowDiskSpace
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100 < 15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk space on audit server"
+          description: "Disk usage at {{ printf \"%.1f%%\" ((1 - (1 - $value / 100)) * 100) }} available"
+          
+      # Database connection issues
+      - alert: DatabaseConnectionFailures
+        expr: rate(database_errors_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database connection errors detected"
+          description: "{{ $value }} errors per second"
+```
+
+---
+
+### File 14: `terraform/main.tf` (Infrastructure as Code)
+
+```hcl
+# terraform/main.tf
+terraform {
+  required_version = ">= 1.5.0"
+  
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  
+  backend "s3" {
+    bucket = "security-audit-terraform-state"
+    key    = "prod/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+locals {
+  environment = var.environment
+  app_name    = "security-audit-${local.environment}"
+}
+
+variable "aws_region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "environment" {
+  type    = string
+  default = "dev"
+}
+
+variable "instance_count" {
+  type    = number
+  default = 2
+}
+
+# -------------------------------------------------------------------
+# VPC & NETWORKING
+# -------------------------------------------------------------------
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+  
+  tags = {
+    Name        = "${local.app_name}-vpc"
+    Environment = local.environment
+  }
+}
+
+resource "aws_subnet" "public" {
+  count                   = var.environment == "prod" ? 2 : 1
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet(aws_vpc.main.cidr_block, 8, count.index)
+  map_public_ip_on_launch = true
+  
+  tags = {
+    Name        = "${local.app_name}-public-${count.index}"
+    Environment = local.environment
+  }
+}
+
+resource "aws_security_group" "dashboard" {
+  name_prefix = "${local.app_name}-sg-"
+  vpc_id      = aws_vpc.main.id
+  
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = var.ssh_cidr_blocks
+  }
+  
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "${local.app_name}-security-group"
+  }
+}
+
+# -------------------------------------------------------------------
+# APPLICATION SERVERS
+# -------------------------------------------------------------------
+resource "aws_instance" "app_servers" {
+  count         = var.instance_count
+  ami           = data.aws_ami.amazon_linux_2.id
+  instance_type = var.environment == "prod" ? "t3.medium" : "t3.small"
+  subnet_id     = aws_subnet.public[count.index % length(aws_subnet.public)].id
+  
+  vpc_security_group_ids = [aws_security_group.dashboard.id]
+  
+  user_data = <<-EOF
+    #!/bin/bash
+    yum update -y
+    yum install -y docker git
+    systemctl start docker
+    systemctl enable docker
+  EOF
+  
+  iam_role = aws_iam_role.ec2_role.arn
+  
+  tags = {
+    Name        = "${local.app_name}-server-${count.index}"
+    Environment = local.environment
+  }
+}
+
+# -------------------------------------------------------------------
+# RDS DATABASE
+# -------------------------------------------------------------------
+resource "aws_db_instance" "postgres" {
+  identifier = "${local.app_name}-db"
+  
+  engine         = "postgres"
+  engine_version = "15.4"
+  instance_class = var.environment == "prod" ? "db.t3.medium" : "db.t3.micro"
+  
+  allocated_storage     = 100
+  max_allocated_storage = 250
+  storage_encrypted     = true
+  
+  db_name  = "security_audit"
+  username = "admin"
+  password = random_password.db_password.result
+  
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  
+  backup_retention_period = var.environment == "prod" ? 7 : 1
+  skip_final_snapshot     = var.environment != "prod"
+  
+  tags = {
+    Name = "${local.app_name}-database"
+  }
+}
+
+# -------------------------------------------------------------------
+# OUTPUTS
+# -------------------------------------------------------------------
+output "dashboard_url" {
+  value = var.environment == "prod" ? "https://security-audit.${var.domain}" : "http://${aws_instance.app_servers[0].private_ip}:5000"
+}
+
+output "api_endpoint" {
+  value = "${var.environment == "prod" ? "https://api" : "http://localhost"}:5000/api"
+}
+```
+
+---
+
+### Summary Table: CI/CD & Monitoring Stack
+
+| Category | Tool/Service | Purpose |
+|----------|--------------|---------|
+| **CI/CD** | GitHub Actions | Automated build, test, deploy pipelines |
+| **Container Registry** | GitHub Container Registry | Store Docker images |
+| **Testing** | pytest + coverage | Unit/integration testing |
+| **Security Scanning** | Bandit + Safety | Static analysis & dependency vulns |
+| **Docker** | Multi-stage builds | Minimized production images |
+| **Monitoring** | Prometheus | Metrics collection & alerting |
+| **Visualization** | Grafana | Dashboards & alerts |
+| **Logging** | Structured JSON + rotation | Centralized log management |
+| **IaC** | Terraform | AWS infrastructure provisioning |
+| **Alerting** | AlertManager + Slack | Multi-channel notifications |
+
+---
+
+### Architecture Monitoring Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         MONITORING STACK                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐           │
+│  │ Application  │───▶│   Export     │───▶│  Prometheus  │           │
+│  │   Metrics    │    │   Middleware │    │   Server     │           │
+│  └──────────────┘    └──────────────┘    └──────────────┘           │
+│         │                                    │                    │
+│         │                                    ▼                    │
+│         │                            ┌──────────────┐             │
+│         │                            │    Grafana   │             │
+│         │                            │   Dashboards │             │
+│         │                            └──────────────┘             │
+│         │                                    │                    │
+│         ▼                                    ▼                    │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐           │
+│  │   Logs       │───▶│  Log Aggr.   │───▶│  Alerting    │           │
+│  │   Files      │    │  (ELK/ Loki) │    │   System     │           │
+│  └──────────────┘    └──────────────┘    └──────────────┘           │
+│                                                                   │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐           │
+│  │  CI/CD       │───▶│   Quality    │───▶│   Deploy     │           │
+│  │   Pipeline   │    │   Gates      │    │   Approval   │           │
+│  └──────────────┘    └──────────────┘    └──────────────┘           │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Key Monitoring KPIs to Track
+
+1. **Availability**: API uptime > 99.5%
+2. **Performance**: P95 API latency < 500ms
+3. **Reliability**: Audit success rate > 95%
+4. **Security**: Zero critical vulnerabilities in dependencies
+5. **Coverage**: Test coverage > 80%
+6. **Cost**: Resource utilization < 70%
