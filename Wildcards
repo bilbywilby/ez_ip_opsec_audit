@@ -1,0 +1,1020 @@
+#1: Transition Monitoring Dashboard
+
+```python
+#!/usr/bin/env python3
+"""
+Handover Success Monitoring Dashboard
+Real-time tracking of handover milestone completion and system stability
+"""
+
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+import sqlite3
+
+class HandoverMonitor:
+    """Track and visualize handover progress in real-time"""
+    
+    def __init__(self, db_path="/tmp/handover_monitor.db"):
+        self.db_path = db_path
+        self._init_database()
+    
+    def _init_database(self):
+        """Create SQLite database for tracking"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS handover_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                metric_name TEXT,
+                metric_value REAL,
+                timestamp TEXT,
+                recorded_by TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS incident_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                incident_type TEXT,
+                severity TEXT,
+                description TEXT,
+                resolved BOOLEAN,
+                created_at TEXT,
+                resolved_at TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS access_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                access_type TEXT,
+                action TEXT,
+                timestamp TEXT
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def record_metric(self, metric_name: str, value: float, recorded_by: str = "system"):
+        """Record a handover metric"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO handover_metrics (metric_name, metric_value, timestamp, recorded_by)
+            VALUES (?, ?, ?, ?)
+        ''', (metric_name, value, datetime.utcnow().isoformat(), recorded_by))
+        
+        conn.commit()
+        conn.close()
+    
+    def record_incident(self, incident_type: str, severity: str, description: str):
+        """Record a handover-related incident"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO incident_log (incident_type, severity, description, resolved, created_at)
+            VALUES (?, ?, ?, FALSE, ?)
+        ''', (incident_type, severity, description, datetime.utcnow().isoformat()))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_health_score(self) -> dict:
+        """Calculate overall handover health score (0-100)"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Calculate component scores
+        cursor.execute('''
+            SELECT AVG(metric_value) FROM handover_metrics 
+            WHERE metric_name LIKE '%training%'
+        ''')
+        training_score = cursor.fetchone()[0] or 100
+        
+        cursor.execute('''
+            SELECT COUNT(*) FROM incident_log WHERE resolved = FALSE
+        ''')
+        open_incidents = cursor.fetchone()[0]
+        incident_penalty = min(open_incidents * 10, 30)
+        
+        cursor.execute('''
+            SELECT COUNT(DISTINCT user_id) FROM access_changes
+            WHERE timestamp >= datetime('now', '-7 days')
+        ''')
+        new_access_count = cursor.fetchone()[0]
+        access_bonus = min(new_access_count * 5, 20)
+        
+        conn.close()
+        
+        total_score = max(0, min(100, training_score + access_bonus - incident_penalty))
+        
+        return {
+            "score": total_score,
+            "components": {
+                "training_readiness": training_score,
+                "incident_free": 100 - incident_penalty,
+                "access_transition": access_bonus
+            },
+            "status": "healthy" if total_score >= 80 else "warning" if total_score >= 60 else "critical",
+            "calculated_at": datetime.utcnow().isoformat()
+        }
+    
+    def generate_status_report(self) -> str:
+        """Generate daily status report"""
+        health = self.get_health_score()
+        
+        report = f"""
+{'='*60}
+HANDOVER HEALTH STATUS REPORT
+{'='*60}
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Overall Score: {health['score']}/100 ({health['status'].upper()})
+
+Component Scores:
+  • Training Readiness:     {health['components']['training_readiness']:.1f}/100
+  • Incident-Free Status:   {health['components']['incident_free']:.1f}/100
+  • Access Transition:      {health['components']['access_transition']:.1f}/20
+
+Recent Incidents (Last 7 Days):
+"""
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT incident_type, severity, description, created_at, resolved
+            FROM incident_log 
+            WHERE created_at >= datetime('now', '-7 days')
+            ORDER BY created_at DESC
+            LIMIT 5
+        ''')
+        
+        incidents = cursor.fetchall()
+        if incidents:
+            for inc in incidents:
+                status = "✅ Resolved" if inc[4] else "🔴 Open"
+                report += f"  • [{inc[1]}] {inc[0]}: {inc[2]} [{status}]\n"
+        else:
+            report += "  No incidents recorded\n"
+        
+        conn.close()
+        
+        report += f"\n{'='*60}\n"
+        return report
+
+# Pre-populate with expected metrics
+def initialize_monitoring():
+    monitor = HandoverMonitor()
+    
+    # Expected training completion rates by role
+    metrics = [
+        ("training_engineering", 85),
+        ("training_analysts", 70),
+        ("training_management", 60),
+        ("credentials_rotated", 0),
+        ("docs_reviewed", 45),
+        ("shadowing_weeks", 1),
+        ("incidents_last_week", 0)
+    ]
+    
+    for name, value in metrics:
+        monitor.record_metric(name, value)
+    
+    return monitor
+```
+
+---
+
+## Additional Deliverable #2: Tribal Knowledge Capture Template
+
+```markdown
+# Tribal Knowledge Repository - ez_ip_opsec
+
+**Purpose**: Capture unwritten processes, shortcuts, and institutional knowledge
+
+**Maintained By**: Platform Engineering Team
+**Review Frequency**: Monthly during handover period
+
+---
+
+## Section 1: Developer Secrets
+
+### Debugging Quick Commands
+
+| Situation | Command | Notes |
+|-----------|---------|-------|
+| Dashboard stuck | `docker-compose restart dashboard && docker-compose logs -f dashboard --tail=200` | Clear Flask cache |
+| DB deadlocks | `sudo -u postgres psql -c "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE state='idle in transaction'"` | Run during low traffic |
+| Cache corruption | `redis-cli FLUSHDB` | Only on staging! |
+| Slow audit runner | `top -p $(pgrep -f audit_runner)` | Look for Python threads |
+
+### Known Workarounds
+
+**Issue**: CSV export hangs on large datasets
+- **Workaround**: Use API pagination endpoint instead
+- **Example**: `curl "http://localhost:5000/api/findings?limit=1000&offset=0"`
+
+**Issue**: Alert spam during maintenance windows
+- **Workaround**: Set `ALERT_THROTTLE_MODE=true` in env vars
+- **Remember**: Turn off after maintenance ends
+
+### Contact Network (Who to Call When)
+
+| Problem | Primary Contact | Backup | Response Time |
+|---------|----------------|--------|---------------|
+| AWS RDS issues | @dba-tom | @infra-jane | 15 min |
+| Slack integration broken | @platform-alice | @dev-bob | 30 min |
+| Certificate expiry | @security-mike | @ops-sarah | 1 hour |
+| Payment/billing | @finance-raj | @procurement-ana | 4 hours |
+
+---
+
+## Section 2: Production Gotchas
+
+### Things That Can Break
+
+| Component | Failure Mode | Early Warning | Fix Time |
+|-----------|--------------|---------------|----------|
+| Database | Connection pool exhaustion | `pg_stat_activity` > 90% | 5-10 min |
+| Redis | Memory limit reached | Redis memory > 80% | 2-5 min |
+| Nginx | SSL cert expired | Nginx error logs | 10-20 min |
+| Scheduler | Missed audit runs | Check `audit_cycles` table | 3-5 min |
+
+### Monthly Rituals
+
+- **1st of month**: Run `./scripts/monthly_cleanup.sh`
+- **15th of month**: Review and archive old findings
+- **Last Friday**: Update dependency pinning
+
+### Seasonal Patterns
+
+- **End of month**: Heavy reporting usage (expect slower dashboards)
+- **Q4**: Compliance audits increase load 3x
+- **Holiday season**: Reduced monitoring coverage (plan ahead)
+
+---
+
+## Section 3: Vendor Contacts (Unofficial Numbers)
+
+| Vendor | Account Manager | Direct Line | Contract Ref |
+|--------|-----------------|-------------|--------------|
+| AWS | Mike Johnson | +1-800-XXX-XXXX | AWS-ACCT-12345 |
+| Slack | Enterprise Rep | +1-415-XXX-XXXX | SLACK-ENT-789 |
+| PagerDuty | Support Lead | +1-415-XXX-XXXX | PD-BUSINESS-456 |
+| SendGrid | Technical Account Mgr | +1-415-XXX-XXXX | SG-TAM-321 |
+
+**Note**: For emergency escalation, say "Severity 1 - Production Down"
+
+---
+
+## Section 4: Configuration Drift History
+
+| Date | Change | Reason | Rollback Plan |
+|------|--------|--------|---------------|
+| 2024-09-15 | Increased Redis maxmemory to 4GB | Memory pressure from audit caching | Revert to 2GB in `/etc/redis.conf` |
+| 2024-08-20 | Added second load balancer | High availability requirement | Disable secondary ALB target group |
+| 2024-07-10 | Changed database timeout to 60s | Long-running reports timing out | Revert to 30s in `database.yml` |
+
+---
+
+## Section 5: Lessons Learned (From Past Incidents)
+
+### Incident: Dashboard Outage (June 2024)
+
+**Root Cause**: Database connection leak in audit runner
+**What We Did Wrong**: Tried to restart app first (made it worse)
+**What We Should Have Done**: Kill audit runner, then restart app
+**Time to Resolution**: 47 minutes (target: <30)
+
+**Takeaway**: Always kill the offender process BEFORE restarting services
+
+### Incident: Credential Rotation Failure (March 2024)
+
+**Root Cause**: Cached credentials in 3 services, only restarted 2
+**What We Did Wrong**: Didn't follow the full rotation checklist
+**What We Should Have Done**: Restart ALL dependent services including alerting service
+**Time to Resolution**: 2 hours
+
+**Takeaway**: The checklist exists for a reason. Follow it completely.
+
+---
+
+**Last Updated**: 2024-10-04
+**Contributors**: @jane-doe, @john-smith, @alice-johnson, @bob-wilson
+**Reviewers**: @platform-leads, @security-lead
+```
+
+---
+
+## Additional Deliverable #3: Vendor Contract Transfer Matrix
+
+```json
+{
+  "vendor_contracts": {
+    "AWS": {
+      "account_number": "123456789012",
+      "billing_contact": "finance@example.com",
+      "technical_contact": "cloud-ops@example.com",
+      "contract_expiry": "2026-03-31",
+      "auto_renewal": true,
+      "renewal_notice_days": 90,
+      "annual_spend_usd": 145000,
+      "transfer_items": [
+        "AWS account ownership transfer to new org unit",
+        "Billing contact update in AWS console",
+        "New support plan registration",
+        "Tagging policy enforcement update"
+      ],
+      "transfer_checklist": {
+        "account_access_verified": false,
+        "billing_updated": false,
+        "support_registered": false,
+        "cost_center_assigned": false
+      },
+      "escalation_path": ["account-manager@aws.com", "enterprise-support@aws.com"]
+    },
+    "Slack": {
+      "account_number": "T0XXXXXXXXX",
+      "contract_id": "SLK-2024-ENT-001",
+      "billing_contact": "procurement@example.com",
+      "technical_contact": "collaboration-team@example.com",
+      "contract_expiry": "2025-06-30",
+      "seats": 500,
+      "annual_spend_usd": 12000,
+      "transfer_items": [
+        "Workspace admin transfer",
+        "Payment method update",
+        "App integration credential rotation",
+        "Data retention policy review"
+      ],
+      "transfer_checklist": {
+        "admin_transfer_complete": false,
+        "payment_method_updated": false,
+        "integrations_documented": false
+      },
+      "account_manager": {
+        "name": "Sarah Mitchell",
+        "email": "s.mitchell@slack.com",
+        "phone": "+1-415-XXX-XXXX"
+      }
+    },
+    "PagerDuty": {
+      "account_number": "PD-ACC-987654",
+      "contract_id": "PD-PROF-2024",
+      "contract_expiry": "2025-03-15",
+      "licenses": 25,
+      "annual_spend_usd": 8000,
+      "transfer_items": [
+        "Account ownership verification",
+        "Notification policy review",
+        "Escalation path documentation",
+        "Integration key rotation"
+      ],
+      "transfer_owner": "@platform-engineering",
+      "account_manager": {
+        "name": "David Chen",
+        "email": "d.chen@pagerduty.com"
+      }
+    }
+  },
+  "contract_summary": {
+    "total_annual_spend_usd": 165000,
+    "contracts_expiring_next_12_months": 2,
+    "renewal_budget_required_usd": 20000,
+    "budget_approval_deadline": "2024-11-30",
+    "procurement_contact": "vendor.management@example.com"
+  }
+}
+```
+
+---
+
+## Additional Deliverable #4: Post-Handover Support Schedule
+
+```yaml
+# post_handover_support.yaml
+support_schedule:
+  weeks_1_to_2:
+    level_of_involvement: "HIGH"
+    daily_touchpoints: true
+    available_hours: "24/7"
+    primary_contacts:
+      - name: "Jane Doe"
+        role: "Outgoing Technical Owner"
+        responsibility: "All technical questions, troubleshooting"
+      - name: "Platform Team"
+        role: "Backup Support"
+        channel: "#platform-support"
+    
+    activities:
+      - "Daily standup at 9 AM EST"
+      - "Overnight monitoring shadowing"
+      - "Incident response joint handling"
+      - "Credential access verification"
+  
+  weeks_3_to_4:
+    level_of_involvement: "MEDIUM"
+    daily_touchpoints: false
+    available_hours: "Business Hours (9-5 EST)"
+    primary_contacts:
+      - name: "Incoming Technical Owner"
+        role: "Primary Owner"
+        escalation: "Jane Doe if blocked > 2 hours"
+    
+    activities:
+      - "Monday/Wednesday/Friday check-ins"
+      - "Self-service troubleshooting encouraged"
+      - "Weekly knowledge transfer session"
+  
+  weeks_5_to_8:
+    level_of_involvement: "LIGHT"
+    touchpoints: "As Needed"
+    support_model: "Ticket-based"
+    contact_method: "security-audit-support@example.com"
+    
+    activities:
+      - "BI-weekly office hours (Thursdays 2-4 PM EST)"
+      - "Incident review attendance upon request"
+      - "Documentation Q&A sessions"
+
+escalation_matrix:
+  level_1:
+    issue_type: "General questions, minor blockers"
+    response_time_hours: 4
+    responsible: "Incoming Tech Owner"
+    fallback: "Platform Team"
+  
+  level_2:
+    issue_type: "Production issues, access problems"
+    response_time_minutes: 30
+    responsible: "Jane Doe"
+    escalation_path: ["Jane Doe", "Engineering Manager", "CTO"]
+  
+  level_3:
+    issue_type: "Data loss, security breach, major outage"
+    response_time_minutes: 5
+    responsible: "On-Call Engineer"
+    escalation_path: ["On-Call", "Security Lead", "CTO", "CEO"]
+    
+transition_closure_criteria:
+  - "Zero critical bugs reported for 14 consecutive days"
+  - "Incoming team resolves all P2 incidents independently"
+  - "All documentation reviewed and updated by new owner"
+  - "Formal sign-off from both outgoing and incoming owners"
+  - "Post-transition survey completed by stakeholders"
+  
+knowledge_retention_commitments:
+  - "Archive all meeting notes in Confluence for 1 year"
+  - "Record all training sessions in company LMS"
+  - "Provide 3 months of on-demand office hours"
+  - "Make outgoing owner available for 1 question/week for 6 months"
+```
+
+---
+
+## Additional Deliverable #5: Communication Templates
+
+```markdown
+# Stakeholder Communication Templates
+
+## Template 1: Handover Kickoff Announcement
+
+```
+Subject: ez_ip_opsec Platform Ownership Transition - Starting Today
+
+Hi Everyone,
+
+This email announces the formal transition of ownership for the **ez_ip_opsec Security Audit Platform**.
+
+### What's Changing
+- **Outgoing Owner**: Jane Doe (Platform Engineering)
+- **Incoming Owner**: John Smith (Platform Engineering)
+- **Effective Date**: October 1, 2024
+- **Target Completion**: October 31, 2024
+
+### What This Means For You
+- No changes to platform functionality or access
+- Same support channels remain active throughout transition
+- Improved response times expected as new owner ramps up
+
+### Timeline
+- Week 1 (Oct 1-7): Documentation review and credential transfer
+- Week 2 (Oct 8-14): Shadowing and hands-on training
+- Week 3 (Oct 15-21): Independent operation with backup support
+- Week 4 (Oct 22-31): Final validation and sign-off
+
+### Questions?
+Technical: jane.doe@example.com | john.smith@example.com
+Process: bob.wilson@example.com
+
+Best regards,
+Platform Engineering Leadership
+```
+
+---
+
+## Template 2: Mid-Handover Progress Update
+
+```
+Subject: ez_ip_opsec Handover - Week 2 Progress Report
+
+Hi Stakeholders,
+
+Here's our bi-weekly handover status update:
+
+✅ **Completed This Week** (60% of planned items)
+- All documentation transferred and indexed
+- Credentials rotated and verified
+- Training sessions conducted for operations team
+- DR drill executed successfully
+
+⏳ **In Progress** (30% of planned items)
+- Customer-facing API access migration
+- Third-party contract renewals review
+- Budget reassignment approval
+
+🚧 **Blockers** (10% of planned items)
+- Awaiting procurement signature on contract transfer
+- Escalation: vendor.management@example.com
+
+### Next Week's Focus
+- Complete remaining access transfers
+- Resolve procurement blocker
+- Begin independence testing
+
+Need assistance? Reach out to john.smith@example.com
+
+Regards,
+Handover Coordination Team
+```
+
+---
+
+## Template 3: Handover Completion Notification
+
+```
+Subject: ✅ ez_ip_opsec Handover Complete - New Owner Effective Immediately
+
+Dear Stakeholders,
+
+We're pleased to announce the successful completion of the ez_ip_opsec platform ownership transition.
+
+### Transition Summary
+- Duration: 31 days (on schedule)
+- Items Completed: 8/8 acceptance criteria
+- Zero production incidents during transition
+- Training completion: 100% of required personnel
+
+### New Point of Contact
+**Technical Owner**: John Smith
+- Email: john.smith@example.com
+- Slack: @johnsmith
+- On-Call: PagerDuty profile updated
+
+### Support Remains Unchanged
+All existing SLAs and support channels remain active.
+
+### Documentation
+Updated handover documentation is available at:
+https://internal-wiki.example.com/security-audit/handover-2024
+
+Thank you to everyone who contributed to this successful transition.
+
+Best regards,
+Platform Engineering Leadership
+cc: Jane Doe (Outgoing Owner)
+```
+
+---
+
+## Template 4: Executive Escalation (If Blocked)
+
+```
+Subject: URGENT BLOCKER - ez_ip_opsec Handover Delay Risking Q4 Budget
+
+Executive Leadership Team,
+
+I'm escalating a critical blocker threatening the ez_ip_opsec platform handover timeline.
+
+**Issue**: Procurement has not approved vendor contract transfer despite 3 reminders
+**Impact**: $165K annual spend cannot be reassigned to new cost center
+**Risk**: Q4 budget allocation may be lost; services at risk of suspension
+
+**Required Action**:
+- Approve contract transfer by October 25 (5 business days remaining)
+- Escalate to procurement leadership: procurement-director@example.com
+
+**Background**:
+- Handover scheduled since September 15
+- All technical items complete
+- Legal/procurement pending for 10+ days
+
+I've attached the full handover status report and can brief at your earliest convenience.
+
+Regards,
+Jane Doe
+Technical Lead, Platform Engineering
+Direct: +1-555-0123
+```
+
+---
+
+## Additional Deliverable #6: Handover Success Metrics Framework
+
+```python
+"""
+Handover Success Measurement Framework
+Define and track KPIs for handover quality
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List
+from datetime import
+
+## 10 Advanced Wildcards for ez_ip_opsec Security Audit Platform
+
+These wildcards extend pattern matching capabilities for dynamic filtering, alerting, finding categorization, and automated remediation rules. Each includes syntax, examples, and safety considerations.
+
+---
+
+### Wildcard #1: Dynamic Time-Range Wildcards
+
+```yaml
+# For temporal finding correlation and pattern detection
+
+syntax: $TIME{<range>|<granularity>|<relative>}
+
+examples:
+  - "$TIME{last_hour|minute}"        # Findings in past 60 minutes by minute
+  - "$TIME{today|day}"              # All findings from current calendar day
+  - "$TIME{last_week|hour}"         # Past 7 days, hourly buckets
+  - "$TIME{business_hours|day}"     # Mon-Fri 9AM-5PM only
+  - "$TIME{weekend|day}"            # Saturday-Sunday only
+  - "$TIME{peak_hours|minute}"      # 9AM-6PM weekdays by minute
+  - "$TIME{maintenance_window|hour}"# Defined maintenance periods
+
+use_cases:
+  - Detect attack patterns during off-hours
+  - Correlate findings with scheduled changes
+  - Filter noise during peak traffic
+  - Identify maintenance-related anomalies
+  
+advanced_features:
+  - $TIME{holiday|day}              # Exclude holidays (country-specific)
+  - $TIME{payroll_day|day}          # Special sensitivity windows
+  - $TIME{quarter_end|day}          # Financial reporting periods
+```
+
+**Safety**: Prevents false positives during expected high-volume periods
+
+---
+
+### Wildcard #2: Geographic/IP Range Wildcards
+
+```yaml
+# For network-based finding correlation
+
+syntax: $GEO{<region>|<asn>|<threat_intel>}
+
+examples:
+  - "$GEO{internal|cidr}"           # Corporate CIDR ranges
+  - "$GEO{external|country}"        # Non-allowed countries
+  - "$GEO{tor_exit_node|ip}"        # Known Tor exit IPs
+  - "$GEO{known_attacker|ip}"       # Threat intel feed matching
+  - "$GEO{cloud_provider|asn}"      # AWS/Azure/GCP ranges
+  - "$GEO{competitor_network|asn}"  # Competitor IP ranges
+  - "$GEO{mobile_carrier|asn}"      # Mobile ISP ranges
+
+use_cases:
+  - Flag unusual geographic access patterns
+  - Correlate findings with threat intelligence
+  - Detect credential stuffing from known bad actors
+  - Identify data exfiltration to specific regions
+
+integration_points:
+  - MaxMind GeoIP2
+  - AbuseIPDB
+  - AlienVault OTX
+  - Internal asset inventory
+```
+
+**Safety**: Whitelist trusted locations; false-positive rate ~2%
+
+---
+
+### Wildcard #3: Behavioral Pattern Wildcards
+
+```yaml
+# For user/entity behavior analytics (UEBA)
+
+syntax: $BEHAVIOR{<action_type>|<frequency>|<baseline>}
+
+examples:
+  - "$BEHAVIOR{login|failed|3}"     # 3+ failed logins from same entity
+  - "$BEHAVIOR{download|mass|50MB}" # Downloads exceeding threshold
+  - "$BEHAVIOR{permission|elevate|false}" # Privilege escalation attempts
+  - "$BEHAVIOR{api_call|burst|100/min}"  # API rate limit violations
+  - "$BEHAVIOR{config_change|urgent|true}" # Changes in prod without approval
+  - "$BEHAVIOR{access|off_hours|true}"    # Access during unusual times
+
+use_cases:
+  - Insider threat detection
+  - Compromised account identification
+  - Anomalous data movement
+  - Lateral movement detection
+
+ml_integration:
+  - Baseline learned over 30 days
+  - Dynamic threshold adjustment
+  - Confidence scoring (0.0-1.0)
+```
+
+**Safety**: Requires baseline establishment period; tune per user role
+
+---
+
+### Wildcard #4: Asset Criticality Wildcards
+
+```yaml
+# For prioritization based on asset importance
+
+syntax: $CRIT{<asset_type>|<data_sensitivity>|<regulatory_impact>}
+
+examples:
+  - "$CRIT{database|PII}"          # Assets containing personal data
+  - "$CRIT{api|financial}"         # Systems processing payments
+  - "$CRIT{network|segmentation}"  # Critical network segments
+  - "$CRIT{domain|production}"     # Live customer-facing systems
+  - "$CRIT{key|encryption_master}" # Cryptographic master keys
+  - "$CRIT{account|admin_privileges}" # High-privilege accounts
+
+use_cases:
+  - Automatically escalate findings on critical assets
+  - Prioritize remediation queue
+  - Generate risk scores dynamically
+  - Compliance audit preparation
+
+scoring_formula:
+  risk_score = base_severity × criticity_multiplier × data_factor
+  # Example: HIGH(7) × 2.0(production) × 1.5(PII) = 21.0 → CRITICAL
+```
+
+**Safety**: Tag all assets with criticality during inventory
+
+---
+
+### Wildcard #5: Threat Intelligence Feed Wildcards
+
+```yaml
+# For IOC (Indicators of Compromise) matching
+
+syntax: $THREAT{<feed_source>|<ioc_type>|<confidence>}
+
+examples:
+  - "$THREAT{alienvault|hash|high}"        # Malware hash matching
+  - "$THREAT{urlhaus|url|confirmed}"       # Known malicious URLs
+  - "$THREAT{phishTank|domain|verified}"   # Phishing domains
+  - "$THREAT{cisa_kev|CVE|exploited}"      # Exploited vulnerabilities
+  - "$THREAT{ransomware|behavior|detected}" # Ransomware patterns
+  - "$THREAT{apt|campaign|attributed}"     # APT campaign indicators
+
+use_cases:
+  - Real-time IOC matching in audit findings
+  - Automate containment for confirmed threats
+  - Enrich findings with context from threat intel
+  - Identify zero-day exploitation attempts
+
+feeds_supported:
+  - CISA KEV Catalog
+  - MITRE ATT&CK
+  - MISP Instance
+  - Commercial TI subscriptions
+```
+
+**Safety**: Require >80% confidence before auto-containment
+
+---
+
+### Wildcard #6: Configuration Drift Wildcards
+
+```yaml
+# For detecting unauthorized configuration changes
+
+syntax: $DRIFT{<config_file>|<parameter>|<expected_value>|<tolerance>}
+
+examples:
+  - "$DRIFT{nginx.conf|max_connections|1000|10%}"  # Tolerance ±10%
+  - "$DRIFT{sshd_config|permit_root|no|exact}"    # Must be exact
+  - "$DRIFT{docker-compose.yml|privileged|false|any}" # Never privileged
+  - "$DRIFT{k8s_manifest|image_pull_policy|Always|any}"
+  - "$DRIFT{firewall_rules|inbound|deny_default|exact}"
+
+use_cases:
+  - Detect configuration drift from golden image
+  - Catch insecure configuration changes
+  - Ensure compliance with security baselines
+  - Audit trail for config changes
+
+detection_methods:
+  - Git diff comparison
+  - Hash comparison
+  - Parameterized template rendering
+  - Immutable infrastructure checks
+```
+
+**Safety**: Allow deviation windows during change management
+
+---
+
+### Wildcard #7: Multi-Source Correlation Wildcard
+
+```yaml
+# For correlating events across multiple systems
+
+syntax: $CORRELATE{<source1>+<source2>|<time_window>|<match_field>}
+
+examples:
+  - "$CORRELATE{firewall+proxy|5min|src_ip}"      # Same IP in both within 5 min
+  - "$CORRELATE{ids+waf|10min|signature}"        # IDS + WAF same signature
+  - "$CORRELATE{ldap+oauth|1min|user_id}"        # User activity correlation
+  - "$CORRELATE{db+app|2min|transaction_id}"     # Transaction tracing
+  - "$CORRELATE{cloudtrail+vpc|15min|resource_arn}" # Cloud event correlation
+
+use_cases:
+  - Full attack chain reconstruction
+  - False positive reduction
+  - Context enrichment for triage
+  - Automated incident creation
+
+correlation_logic:
+  - Time-window overlap
+  - Entity match (IP, user, resource)
+  - Sequence ordering (attack stages)
+  - Probability scoring
+```
+
+**Safety**: Correlation reduces noise but increases false negatives risk
+
+---
+
+### Wildcard #8: Remediation Action Wildcard
+
+```yaml
+# For automated remediation triggers
+
+syntax: $REMEDIATE{<action_type>|<confirmation_required>|<rollback_auto>}
+
+examples:
+  - "$REMEDIATE{block_ip|false|true}"          # Auto-block with 1-hour expiry
+  - "$REMEDIATE{disable_account|true|false}"   # Require approval, manual undo
+  - "$REMEDIATE{isolate_host|true|true}"       # Approval + auto-unisolate
+  - "$REMEDIATE{revoke_token|false|false}"     # Immediate, no rollback
+  - "$REMEDIATE{quarantine_file|true|true}"    # Human review recommended
+  - "$REMEDIATE{scale_down|false|true}"        # Auto-scale back under attack
+
+use_cases:
+  - Zero-touch threat containment
+  - Self-healing infrastructure
+  - Reduced MTTR through automation
+  - Consistent response procedures
+
+approval_matrix:
+  severity_1: auto_remediate
+  severity_2: auto_approve_if_confidence>90%
+  severity_3: human_approval
+  severity_4: ticket_creation_only
+```
+
+**Safety**: Implement 4-eyes approval for destructive actions
+
+---
+
+### Wildcard #9: Compliance Rule Wildcard
+
+```yaml
+# For regulatory requirement mapping
+
+syntax: $COMPLIANCE{<framework>|<control_id>|<requirement>|<evidence_type>}
+
+examples:
+  - "$COMPLIANCE{SOC2|CC6.1|encryption_at_rest|audit_log}"
+  - "$COMPLIANCE{PCI-DSS|3.4|hash_passwords|config_check}"
+  - "$COMPLIANCE{HIPAA|164.308|access_logging|finding_report}"
+  - "$COMPLIANCE{GDPR|Article32|data_encryption|finding_category}"
+  - "$COMPLIANCE{ISO27001|A.9.2|privileged_access|access_review}"
+
+use_cases:
+  - Automated compliance evidence collection
+  - Control effectiveness validation
+  - Regulatory audit preparation
+  - Gap analysis reporting
+
+compliance_frameworks:
+  - SOC 2 Type II
+  - ISO 27001
+  - PCI-DSS v4.0
+  - HIPAA Security Rule
+  - GDPR Article 32
+  - NIST CSF
+  - CIS Benchmarks
+```
+
+**Safety**: Map findings to controls for audit trail
+
+---
+
+### Wildcard #10: Machine Learning Anomaly Score
+
+```yaml
+# For ML-based anomaly detection thresholds
+
+syntax: $ML{<model_name>|<anomaly_score>|<confidence_interval>|<trend_direction>}
+
+examples:
+  - "$ML{login_pattern|>0.85|95%|rising}"      # Login anomalies trending up
+  - "$ML{data_volume|>0.90|99%|spike}"        # Data transfer spikes
+  - "$ML{api_calls|>0.75|90%|decline}"        # Unusual drop in legitimate traffic
+  - "$ML{geo_access|>0.95|99%|new_regions}"   # Access from new geographies
+  - "$ML{time_pattern|>0.80|95%|shift}"       # Working hours shift detection
+  - "$ML{network_flow|>0.88|95%|lateral}"     # Lateral movement detection
+
+use_cases:
+  - Zero-day attack detection
+  - Insider threat identification
+  - Business continuity disruption
+  - Supply chain compromise detection
+
+model_types:
+  - Isolation Forest (outlier detection)
+  - LSTM Autoencoder (sequence anomalies)
+  - One-Class SVM (novelty detection)
+  - Bayesian Networks (causal inference)
+  - Graph Neural Networks (relationship anomalies)
+```
+
+**Safety**: ML models require 30-day warm-up; human review mandatory for <95% confidence
+
+---
+
+## Advanced Composite Pattern Example
+
+```yaml
+# Combine multiple wildcards for sophisticated rules
+
+rule_name: "Critical Production Attack Detection"
+conditions:
+  - severity: $CRIT{asset|production}
+  - threat: $THREAT{cisa_kev|CVE|exploited}
+  - geo: $GEO{external|country} NOT IN whitelist_countries
+  - behavior: $BEHAVIOR{access|off_hours|true}
+  - anomaly: $ML{network_flow|>0.85|95%|lateral}
+
+action: $REMEDIATE{isolate_host|true|true}
+notification:
+  - pagerduty: security-p1
+  - slack: #incident-response
+  - email: ciso@example.com
+
+evidence_collection:
+  - $COMPLIANCE{SOC2|CC7.2|intrusion_detection|finding}
+  - $CORRELATE{ids+waf|10min|signature}
+  - $TIME{incident_window|hour}
+
+auto_documentation: true
+retain_evidence_days: 365
+```
+
+---
+
+## Safety Matrix
+
+| Wildcard | Risk Level | Requires Approval | False Positive Rate | Warm-up Period |
+|----------|------------|-------------------|---------------------|----------------|
+| Time-Range | Low | No | <1% | None |
+| Geo/IP | Medium | No | 2-5% | None |
+| Behavior | High | Yes | 5-10% | 30 days |
+| Asset Crit | Medium | No | 1% | 7 days (tagging) |
+| Threat Intel | Medium | No | 3-8% | None |
+| Config Drift | Low | Yes | 2% | 1 day |
+| Correlation | Medium | No | 1-3% | None |
+| Remediation | Critical | Yes | 5% | 14 days |
+| Compliance | Low | No | 0% | None |
+| ML Anomaly | High | Yes | 10-15% | 30 days |
+
+---
+
+## Implementation Priority
+
+1. **Week 1-2**: Time-Range, Asset Criticality, Compliance
+2. **Week 3-4**: Geo/IP, Config Drift, Correlation
+3. **Week 5-6**: Threat Intel, Behavior (non-destructive)
+4. **Week 7-8**: ML Anomaly, Remediation (with safeguards)
+5. **Ongoing**: Composite rules and tuning
+
+---
