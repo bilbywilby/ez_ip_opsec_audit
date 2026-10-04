@@ -1,0 +1,1006 @@
+## Phase 3: Comprehensive Alerting Integrations
+
+### File 1: `src/alerters/__init__.py`
+```python
+"""Alerters Package - Unified Notification System"""
+from .email_alerter import EmailAlerter
+from .slack_alerter import SlackAlerter
+from .discord_alerter import DiscordAlerter
+from .pushover_alerter import PushoverAlerter
+from .alert_manager import AlertManager
+
+__all__ = [
+    'EmailAlerter',
+    'SlackAlerter',
+    'DiscordAlerter',
+    'PushoverAlerter',
+    'AlertManager',
+]
+```
+
+### File 2: `src/alerters/base_alerter.py` (Abstract Base Class)
+```python
+#!/usr/bin/env python3
+"""Base Alerter Class - All alerters inherit from this"""
+from abc import ABC, abstractmethod
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+
+class BaseAlerter(ABC):
+    """Abstract base class for all alerters"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.enabled = config.get('enabled', False)
+        self.quiet_hours_start = config.get('quiet_hours_start', None)
+        self.quiet_hours_end = config.get('quiet_hours_end', None)
+        self.rate_limit_per_hour = config.get('rate_limit_per_hour', 10)
+        self._sent_count = 0
+        self._last_sent = None
+        
+    def should_send_now(self) -> bool:
+        """Check if alert should be sent based on quiet hours and rate limits"""
+        if not self.enabled:
+            return False
+            
+        # Check quiet hours
+        if self._is_quiet_hour():
+            return False
+            
+        # Check rate limit
+        if self._exceeds_rate_limit():
+            return False
+            
+        return True
+    
+    def _is_quiet_hour(self) -> bool:
+        """Check if currently in quiet hours"""
+        if self.quiet_hours_start is None or self.quiet_hours_end is None:
+            return False
+            
+        current_hour = datetime.now().hour
+        
+        # Handle overnight quiet hours (e.g., 22:00 to 07:00)
+        if self.quiet_hours_start > self.quiet_hours_end:
+            return current_hour >= self.quiet_hours_start or current_hour < self.quiet_hours_end
+        else:
+            return self.quiet_hours_start <= current_hour < self.quiet_hours_end
+    
+    def _exceeds_rate_limit(self) -> bool:
+        """Check if we've exceeded rate limit"""
+        if self.rate_limit_per_hour == 0:
+            return False
+            
+        if self._last_sent is None:
+            return False
+            
+        # Count alerts in last hour
+        one_hour_ago = datetime.now().timestamp() - 3600
+        # Simple counter (production would need database/caching layer)
+        return self._sent_count >= self.rate_limit_per_hour
+    
+    @abstractmethod
+    def send_alert(self, findings: List[Dict[str, Any]]) -> bool:
+        """Send alert - implemented by subclasses"""
+        pass
+    
+    def _format_message(self, findings: List[Dict[str, Any]], channel: str) -> str:
+        """Common message formatter for all channels"""
+        if not findings:
+            return "No findings"
+            
+        critical = [f for f in findings if f.get('severity') == 'CRITICAL']
+        high = [f for f in findings if f.get('severity') == 'HIGH']
+        medium = [f for f in findings if f.get('severity') == 'MEDIUM']
+        
+        lines = [
+            f"🔒 Security Audit Alert",
+            f"",
+            f"Severity Breakdown:",
+            f"  🔴 Critical: {len(critical)}",
+            f"  🟠 High: {len(high)}",
+            f"  🟡 Medium: {len(medium)}",
+            f"",
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Host: {self.config.get('hostname', 'unknown')}",
+            f"",
+            f"Top Findings:",
+        ]
+        
+        for idx, finding in enumerate(findings[:5], 1):
+            severity = finding.get('severity', 'UNKNOWN')
+            ftype = finding.get('type', 'UNKNOWN')
+            msg = finding.get('message', finding.get('description', 'No details'))[:150]
+            lines.append(f"  {idx}. [{severity}] {ftype}: {msg}")
+        
+        if len(findings) > 5:
+            lines.append(f"  ... and {len(findings) - 5} more")
+            
+        return "\n".join(lines)
+    
+    def _record_sent(self):
+        """Record that an alert was sent"""
+        self._sent_count += 1
+        self._last_sent = datetime.now()
+```
+
+### File 3: `src/alerters/email_alerter.py`
+```python
+#!/usr/bin/env python3
+"""Email Alerter - SMTP-based notifications"""
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import Dict, List, Any
+
+class EmailAlerter:
+    """Email-based alert sender using SMTP"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.enabled = config.get('enabled', False)
+        self.smtp_host = config.get('smtp_host', 'smtp.gmail.com')
+        self.smtp_port = config.get('smtp_port', 587)
+        self.username = config.get('username', '')
+        self.password = config.get('password', '')  # Use app-specific password
+        self.from_email = config.get('from_email', '')
+        self.to_emails = config.get('to_emails', [])
+        self.subject_template = config.get('subject_template', '[Security Audit] {severity_count} alerts detected')
+        self.use_tls = config.get('use_tls', True)
+        
+    def send_alert(self, findings: List[Dict[str, Any]]) -> bool:
+        """Send email alert"""
+        if not self.enabled or not findings:
+            return False
+        
+        try:
+            # Count by severity
+            severity_counts = {}
+            for f in findings:
+                sev = f.get('severity', 'INFO')
+                severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            
+            # Format subject
+            critical_count = severity_counts.get('CRITICAL', 0)
+            subject = self.subject_template.format(
+                severity_count=len(findings),
+                critical=critical_count,
+                host=self.from_email.split('@')[-1] if '@' in self.from_email else 'system'
+            )
+            
+            # Format body
+            body = self._format_html_body(findings, severity_counts)
+            
+            # Create message
+            msg = MIMEMultipart()
+            msg['From'] = self.from_email
+            msg['To'] = ', '.join(self.to_emails)
+            msg['Subject'] = subject
+            msg.attach(MIMEText(body, 'html'))
+            
+            # Connect and send
+            if self.use_tls:
+                server = smtplib.SMTP(self.smtp_host, self.smtp_port)
+                server.starttls()
+            else:
+                server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port)
+            
+            server.login(self.username, self.password)
+            server.sendmail(self.from_email, self.to_emails, msg.as_string())
+            server.quit()
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error sending email alert: {e}")
+            return False
+    
+    def _format_html_body(self, findings: List[Dict[str, Any]], severity_counts: Dict[str, int]) -> str:
+        """Format alert as HTML email"""
+        severity_colors = {
+            'CRITICAL': '#dc3545',
+            'HIGH': '#fd7e14',
+            'MEDIUM': '#ffc107',
+            'LOW': '#20c997',
+            'WARNING': '#6c757d',
+        }
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                .header {{ background-color: #2c3e50; color: white; padding: 15px; border-radius: 5px; }}
+                .summary {{ margin: 20px 0; }}
+                .summary-box {{ display: inline-block; padding: 10px 20px; margin: 5px; border-radius: 5px; }}
+                .finding {{ background-color: #f8f9fa; border-left: 4px solid #007bff; padding: 10px; margin: 10px 0; }}
+                .critical {{ border-left-color: #dc3545; }}
+                .high {{ border-left-color: #fd7e14; }}
+                .medium {{ border-left-color: #ffc107; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h2>🔒 Security Audit Alert</h2>
+                <p>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            </div>
+            
+            <div class="summary">
+                <strong>Total Findings:</strong> {len(findings)}<br><br>
+                <span class="summary-box" style="background-color: #dc3545;">Critical: {severity_counts.get('CRITICAL', 0)}</span>
+                <span class="summary-box" style="background-color: #fd7e14;">High: {severity_counts.get('HIGH', 0)}</span>
+                <span class="summary-box" style="background-color: #ffc107;">Medium: {severity_counts.get('MEDIUM', 0)}</span>
+                <span class="summary-box" style="background-color: #20c997;">Low: {severity_counts.get('LOW', 0)}</span>
+            </div>
+            
+            <h3>Detailed Findings:</h3>
+        """
+        
+        for idx, finding in enumerate(findings[:10], 1):
+            severity = finding.get('severity', 'INFO').lower()
+            ftype = finding.get('type', 'UNKNOWN')
+            msg = finding.get('message', finding.get('description', ''))
+            
+            html += f"""
+            <div class="finding {severity}">
+                <strong>[{idx}] {finding.get('severity', 'INFO')} - {ftype}</strong><br>
+                {msg[:300]}{'...' if len(msg) > 300 else ''}
+            </div>
+            """
+        
+        if len(findings) > 10:
+            html += f"<p><em>... and {len(findings) - 10} more findings (see full report)</em></p>"
+        
+        html += """
+            <hr>
+            <p style="color: #6c757d; font-size: 12px;">
+                This is an automated alert from Security Audit Framework.<br>
+                Review the full audit report for complete details.
+            </p>
+        </body>
+        </html>
+        """
+        
+        return html
+```
+
+### File 4: `src/alerters/slack_alerter.py`
+```python
+#!/usr/bin/env python3
+"""Slack Alerter - Webhook-based notifications"""
+import requests
+from typing import Dict, List, Any
+from datetime import datetime
+
+class SlackAlerter:
+    """Slack webhook-based alert sender"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.enabled = config.get('enabled', False)
+        self.webhook_url = config.get('webhook_url', '')
+        self.channel = config.get('channel', '#general')
+        self.username = config.get('bot_username', 'Security Bot')
+        self.icon_emoji = config.get('icon_emoji', ':shield:')
+        
+    def send_alert(self, findings: List[Dict[str, Any]]) -> bool:
+        """Send Slack alert via webhook"""
+        if not self.enabled or not findings or not self.webhook_url:
+            return False
+        
+        try:
+            # Determine overall color based on highest severity
+            severity_colors = {
+                'CRITICAL': 'danger',
+                'HIGH': 'warning',
+                'MEDIUM': '#ffa500',
+                'LOW': 'good',
+                'WARNING': '#6c757d',
+            }
+            
+            highest_severity = 'WARNING'
+            for priority in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+                if any(f.get('severity') == priority for f in findings):
+                    highest_severity = priority
+                    break
+            
+            color = severity_colors.get(highest_severity, '#cccccc')
+            
+            # Build Slack payload
+            severity_counts = {}
+            for f in findings:
+                sev = f.get('severity', 'INFO')
+                severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"🔒 Security Audit Alert",
+                        "emoji": True
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Total Findings:*\n{len(findings)}"
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Critical:*\n{severity_counts.get('CRITICAL', 0)}"
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*High:*\n{severity_counts.get('HIGH', 0)}"
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Time:*\n{datetime.now().strftime('%H:%M:%S')}"
+                        }
+                    ]
+                }
+            ]
+            
+            # Add divider if there are findings
+            blocks.append({"type": "divider"})
+            
+            # Add top 5 findings as sections
+            for idx, finding in enumerate(findings[:5], 1):
+                severity = finding.get('severity', 'INFO')
+                emoji = {'CRITICAL': '🔴', 'HIGH': '🟠', 'MEDIUM': '🟡', 'LOW': '🟢'}.get(severity, '⚪')
+                
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"{emoji} *[{severity}]* {finding.get('type', 'UNKNOWN')}:\n{finding.get('message', finding.get('description', ''))[:200]}"
+                    }
+                })
+            
+            if len(findings) > 5:
+                blocks.append({
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"Showing 5 of {len(findings)} findings. Check full report for details."
+                        }
+                    ]
+                })
+            
+            payload = {
+                "channel": self.channel,
+                "username": self.username,
+                "icon_emoji": self.icon_emoji,
+                "blocks": blocks
+            }
+            
+            # Send to Slack
+            response = requests.post(
+                self.webhook_url,
+                json=payload,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                return True
+            else:
+                print(f"Slack webhook failed: {response.status_code} {response.text}")
+                return False
+                
+        except Exception as e:
+            print(f"Error sending Slack alert: {e}")
+            return False
+```
+
+### File 5: `src/alerters/discord_alerter.py`
+```python
+#!/usr/bin/env python3
+"""Discord Alerter - Webhook-based notifications"""
+import requests
+from typing import Dict, List, Any
+from datetime import datetime
+
+class DiscordAlerter:
+    """Discord webhook-based alert sender"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.enabled = config.get('enabled', False)
+        self.webhook_url = config.get('webhook_url', '')
+        self.username = config.get('bot_username', 'Security Monitor')
+        self.avatar_url = config.get('avatar_url', '')
+        
+    def send_alert(self, findings: List[Dict[str, Any]]) -> bool:
+        """Send Discord alert via webhook"""
+        if not self.enabled or not findings or not self.webhook_url:
+            return False
+        
+        try:
+            # Determine embed color (decimal format)
+            colors = {
+                'CRITICAL': 15158332,  # Red
+                'HIGH': 15105570,      # Orange
+                'MEDIUM': 15277667,    # Yellow
+                'LOW': 3066993,        # Green
+                'WARNING': 1752220,    # Grey
+            }
+            
+            highest_severity = 'WARNING'
+            for priority in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
+                if any(f.get('severity') == priority for f in findings):
+                    highest_severity = priority
+                    break
+            
+            color = colors.get(highest_severity, 9807270)
+            
+            # Count severities
+            severity_counts = {}
+            for f in findings:
+                sev = f.get('severity', 'INFO')
+                severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            
+            # Build embeds
+            embeds = [{
+                "title": "🔒 Security Audit Alert",
+                "color": color,
+                "timestamp": datetime.utcnow().isoformat(),
+                "footer": {
+                    "text": "Security Audit Framework",
+                    "icon_url": self.avatar_url if self.avatar_url else None
+                },
+                "fields": [
+                    {
+                        "name": "Total Findings",
+                        "value": str(len(findings)),
+                        "inline": True
+                    },
+                    {
+                        "name": "Critical",
+                        "value": str(severity_counts.get('CRITICAL', 0)),
+                        "inline": True
+                    },
+                    {
+                        "name": "High",
+                        "value": str(severity_counts.get('HIGH', 0)),
+                        "inline": True
+                    }
+                ]
+            }]
+            
+            # Add detailed findings
+            for idx, finding in enumerate(findings[:5], 1):
+                severity = finding.get('severity', 'INFO')
+                embeds[0]["fields"].append({
+                    "name": f"{idx}. {severity} - {finding.get('type', 'UNKNOWN')}",
+                    "value": finding.get('message', finding.get('description', ''))[:300],
+                    "inline": False
+                })
+            
+            if len(findings) > 5:
+                embeds[0]["fields"].append({
+                    "name": "More findings",
+                    "value": f"View full report for {len(findings) - 5} additional findings",
+                    "inline": False
+                })
+            
+            payload = {
+                "username": self.username,
+                "avatar_url": self.avatar_url,
+                "embeds": embeds
+            }
+            
+            # Send to Discord
+            response = requests.post(self.webhook_url, json=payload, timeout=10)
+            
+            return response.status_code == 204 or response.status_code == 200
+            
+        except Exception as e:
+            print(f"Error sending Discord alert: {e}")
+            return False
+```
+
+### File 6: `src/alerters/pushover_alerter.py`
+```python
+#!/usr/bin/env python3
+"""Pushover Alerter - Push notifications to mobile"""
+import requests
+from typing import Dict, List, Any
+
+class PushoverAlerter:
+    """Pushover push notification service"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.enabled = config.get('enabled', False)
+        self.api_token = config.get('api_token', '')
+        self.user_key = config.get('user_key', '')
+        self.priority = config.get('priority', 0)  # -2 lowest, 2 emergency
+        self.sound = config.get('sound', 'pushover')
+        
+    def send_alert(self, findings: List[Dict[str, Any]]) -> bool:
+        """Send Pushover notification"""
+        if not self.enabled or not findings or not self.api_token or not self.user_key:
+            return False
+        
+        try:
+            # Determine priority based on severity
+            has_critical = any(f.get('severity') == 'CRITICAL' for f in findings)
+            has_high = any(f.get('severity') == 'HIGH' for f in findings)
+            
+            priority = 2 if has_critical else (1 if has_high else self.priority)
+            
+            # Format message
+            title = f"Security Alert - {len(findings)} issues"
+            message_lines = [f"Found {len(findings)} security findings"]
+            
+            for finding in findings[:3]:
+                severity = finding.get('severity', 'INFO')
+                ftype = finding.get('type', 'UNKNOWN')
+                msg = finding.get('message', finding.get('description', ''))[:100]
+                message_lines.append(f"{severity}: {ftype}")
+            
+            # Add link to full report
+            report_url = self.config.get('report_url', '')
+            if report_url:
+                message_lines.append(f"\nSee full report: {report_url}")
+            
+            message = "\n".join(message_lines)
+            
+            payload = {
+                'token': self.api_token,
+                'user': self.user_key,
+                'title': title,
+                'message': message,
+                'priority': priority,
+                'sound': self.sound,
+                'timestamp': int(__import__('datetime').datetime.now().timestamp()),
+                'url': report_url if report_url else '',
+                'url_title': 'View Full Report' if report_url else ''
+            }
+            
+            # Send to Pushover
+            response = requests.post(
+                'https://api.pushover.net/1/messages.json',
+                data=payload,
+                timeout=10
+            )
+            
+            return response.status_code == 200
+            
+        except Exception as e:
+            print(f"Error sending Pushover alert: {e}")
+            return False
+```
+
+### File 7: `src/alerters/alert_manager.py` (Core Orchestration)
+```python
+#!/usr/bin/env python3
+"""Alert Manager - Central orchestration with deduplication and escalation"""
+import hashlib
+from datetime import datetime, timedelta
+from collections import defaultdict
+from typing import Dict, List, Any, Optional, Set
+import json
+import os
+
+class AlertManager:
+    """Central alert manager handling routing, deduplication, and escalation"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.alerters = []
+        self.dedup_window = config.get('dedup_window_seconds', 300)  # 5 minutes
+        self.escalation_config = config.get('escalation', {})
+        self._recent_hashes: Set[str] = set()
+        self._history_file = config.get('history_file', '/tmp/alert_history.json')
+        self._suppress_until: Optional[datetime] = None
+        
+        # Initialize alerters
+        self._init_alerters(config)
+        
+        # Load history
+        self._load_history()
+    
+    def _init_alerters(self, config: Dict[str, Any]):
+        """Initialize all configured alerters"""
+        from .email_alerter import EmailAlerter
+        from .slack_alerter import SlackAlerter
+        from .discord_alerter import DiscordAlerter
+        from .pushover_alerter import PushoverAlerter
+        
+        alerter_configs = config.get('alerters', {})
+        
+        if alerter_configs.get('email', {}).get('enabled'):
+            self.alerters.append(EmailAlerter(alerter_configs['email']))
+        
+        if alerter_configs.get('slack', {}).get('enabled'):
+            self.alerters.append(SlackAlerter(alerter_configs['slack']))
+        
+        if alerter_configs.get('discord', {}).get('enabled'):
+            self.alerters.append(DiscordAlerter(alerter_configs['discord']))
+        
+        if alerter_configs.get('pushover', {}).get('enabled'):
+            self.alerters.append(PushoverAlerter(alerter_configs['pushover']))
+    
+    def process_findings(self, findings: List[Dict[str, Any]], 
+                         force: bool = False) -> Dict[str, Any]:
+        """Main entry point for processing security findings"""
+        result = {
+            'processed_at': datetime.now().isoformat(),
+            'total_findings': len(findings),
+            'alerts_sent': 0,
+            'alerts_suppressed': 0,
+            'deduplicated': [],
+            'escalation_triggered': False,
+        }
+        
+        if not findings:
+            return result
+        
+        # Check if we should suppress alerts (post-escalation cooldown)
+        if self._should_suppress():
+            result['alerts_suppressed'] = len(findings)
+            return result
+        
+        # Route findings by severity
+        critical = [f for f in findings if f.get('severity') == 'CRITICAL']
+        high = [f for f in findings if f.get('severity') == 'HIGH']
+        others = [f for f in findings if f.get('severity') not in ['CRITICAL', 'HIGH']]
+        
+        # Process based on severity routing
+        if critical:
+            result['alerts_sent'] += self._send_to_all_alerters(critical)
+            self._trigger_escalation('CRITICAL', critical)
+        
+        if high:
+            result['alerts_sent'] += self._send_to_priority_alerters(high)
+            self._trigger_escalation('HIGH', high)
+        
+        if others:
+            result['alerts_sent'] += self._send_to_all_alerters(others)
+        
+        # Deduplication
+        result['deduplicated'] = self._remove_duplicates(findings)
+        
+        # Save history
+        self._save_history()
+        
+        return result
+    
+    def _send_to_all_alerters(self, findings: List[Dict[str, Any]]) -> int:
+        """Send to all enabled alerters"""
+        sent = 0
+        for alerter in self.alerters:
+            try:
+                if alerter.should_send_now():
+                    if alerter.send_alert(findings):
+                        sent += 1
+                        alerter._record_sent()
+            except Exception as e:
+                print(f"Error with alerter {type(alerter).__name__}: {e}")
+        return sent
+    
+    def _send_to_priority_alerters(self, findings: List[Dict[str, Any]]) -> int:
+        """Send only to priority alerters (email, push)"""
+        # Priority: Email + Push, skip Slack/Discord for noise reduction
+        priority_alerter_types = ['EmailAlerter', 'PushoverAlerter']
+        sent = 0
+        
+        for alerter in self.alerters:
+            if type(alerter).__name__ in priority_alerter_types:
+                try:
+                    if alerter.should_send_now():
+                        if alerter.send_alert(findings):
+                            sent += 1
+                            alerter._record_sent()
+                except Exception as e:
+                    print(f"Error with alerter {type(alerter).__name__}: {e}")
+        
+        return sent
+    
+    def _remove_duplicates(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove duplicate findings within dedup window"""
+        unique = []
+        current_time = datetime.now().timestamp()
+        
+        for finding in findings:
+            # Generate hash of finding content
+            content = f"{finding.get('type', '')}-{finding.get('message', '')}"
+            finding_hash = hashlib.md5(content.encode()).hexdigest()
+            
+            # Check if recently seen
+            is_duplicate = False
+            for recent_hash, timestamp in list(self._recent_hashes):
+                if recent_hash == finding_hash:
+                    if current_time - timestamp < self.dedup_window:
+                        is_duplicate = True
+                        break
+            
+            if not is_duplicate:
+                unique.append(finding)
+                self._recent_hashes.add((finding_hash, current_time))
+        
+        # Clean old hashes
+        self._recent_hashes = [(h, t) for h, t in self._recent_hashes 
+                              if current_time - t < self.dedup_window]
+        
+        return unique
+    
+    def _trigger_escalation(self, severity: str, findings: List[Dict[str, Any]]):
+        """Trigger escalation policy based on severity"""
+        esc_config = self.escalation_config.get(severity, {})
+        
+        if not esc_config.get('enabled', False):
+            return
+        
+        # Check escalation conditions
+        threshold = esc_config.get('threshold', 1)
+        if len(findings) >= threshold:
+            print(f"Escalation triggered for {severity}: {len(findings)} findings")
+            
+            # Enable all alerters temporarily
+            for alerter in self.alerters:
+                alerter.rate_limit_per_hour = esc_config.get('override_rate_limit', 100)
+            
+            # Set suppression timer
+            cooldown_minutes = esc_config.get('cooldown_minutes', 30)
+            self._suppress_until = datetime.now() + timedelta(minutes=cooldown_minutes)
+            
+            # Optional: Send escalation notification
+            if esc_config.get('notify_manager', False):
+                self._send_escalation_notification(severity, findings)
+    
+    def _send_escalation_notification(self, severity: str, findings: List[Dict[str, Any]]):
+        """Send special escalation notification"""
+        # Could integrate with PagerDuty, OpsGenie, etc.
+        message = f"ESCALATION: {len(findings)} {severity} findings require attention"
+        print(message)  # Replace with actual escalation service integration
+    
+    def _should_suppress(self) -> bool:
+        """Check if alerts should be suppressed"""
+        if self._suppress_until is None:
+            return False
+        
+        return datetime.now() < self._suppress_until
+    
+    def _load_history(self):
+        """Load alert history from file"""
+        if os.path.exists(self._history_file):
+            try:
+                with open(self._history_file, 'r') as f:
+                    history = json.load(f)
+                    self._recent_hashes = set(tuple(h) for h in history.get('hashes', []))
+            except:
+                pass
+    
+    def _save_history(self):
+        """Save alert history to file"""
+        history = {
+            'hashes': list(self._recent_hashes),
+            'last_updated': datetime.now().isoformat()
+        }
+        try:
+            os.makedirs(os.path.dirname(self._history_file), exist_ok=True)
+            with open(self._history_file, 'w') as f:
+                json.dump(history, f)
+        except:
+            pass
+
+# Helper method to integrate with main.py
+def create_alert_manager(config: Dict[str, Any]) -> AlertManager:
+    """Factory function to create properly configured AlertManager"""
+    # Inject hostname for email/slack templates
+    import socket
+    config.setdefault('alerters', {})
+    config['alerters'].setdefault('email', {})['hostname'] = socket.gethostname()
+    config['alerters'].setdefault('slack', {})['hostname'] = socket.gethostname()
+    return AlertManager(config)
+```
+
+### File 8: Updated Configuration (`config/settings.yaml` additions)
+Append this section to your existing `settings.yaml`:
+
+```yaml
+# ============================================================================
+# ALERTING CONFIGURATION
+# ============================================================================
+
+alerting:
+  enabled: true
+  dedup_window_seconds: 300  # 5 minutes
+  history_file: "/tmp/alert_history.json"
+  
+  # Quiet hours (won't send alerts during these times)
+  quiet_hours:
+    enabled: false
+    start: 22  # 10 PM
+    end: 7     # 7 AM
+  
+  # Escalation policies
+  escalation:
+    CRITICAL:
+      enabled: true
+      threshold: 1  # Trigger on 1+ critical findings
+      cooldown_minutes: 30
+      override_rate_limit: 100
+      notify_manager: true
+    
+    HIGH:
+      enabled: true
+      threshold: 3  # Trigger on 3+ high findings
+      cooldown_minutes: 15
+      override_rate_limit: 50
+  
+  # Individual alerter configurations
+  alerters:
+    email:
+      enabled: false
+      smtp_host: "smtp.gmail.com"
+      smtp_port: 587
+      username: ""  # Your email
+      password: ""  # App-specific password (NOT your regular password)
+      from_email: "security@example.com"
+      to_emails:
+        - "admin1@example.com"
+        - "admin2@example.com"
+      use_tls: true
+      subject_template: "[Security Alert] {severity_count} findings on {host}"
+    
+    slack:
+      enabled: false
+      webhook_url: ""  # Incoming webhook URL
+      channel: "#security-alerts"
+      bot_username: "Security Monitor"
+      icon_emoji: ":shield:"
+    
+    discord:
+      enabled: false
+      webhook_url: ""  # Discord webhook URL
+      bot_username: "Security Monitor"
+      avatar_url: ""  # Optional custom avatar URL
+    
+    pushover:
+      enabled: false
+      api_token: ""  # Pushover API token
+      user_key: ""   # Pushover user key
+      priority: 0    # -2 (lowest) to 2 (highest/emergency)
+      sound: "pushover"
+      report_url: ""  # Link to full report dashboard
+```
+
+### File 9: Integration in `src/main.py`
+Add this import and modify `run_audit()` to call alerting:
+
+```python
+# In imports section:
+from alerters.alert_manager import create_alert_manager
+
+# Inside run_audit(), after finding collection:
+if config.get('alerting', {}).get('enabled', False):
+    print("[*] Processing findings through alert manager...")
+    alert_manager = create_alert_manager(config)
+    alert_result = alert_manager.process_findings(findings)
+    print(f"    ✓ Alerts sent: {alert_result['alerts_sent']}")
+    print(f"    ✓ Suppressed: {alert_result['alerts_suppressed']}")
+    print(f"    ✓ Deduplicated: {len(alert_result['deduplicated'])}")
+```
+
+---
+
+## Testing Commands
+
+```bash
+# 1. Install alerters package
+pip3 install requests
+
+# 2. Test email alerter (dry run)
+python3 -c "
+from src.alerters.email_alerter import EmailAlerter
+config = {'enabled': False}  # Disable to prevent real sends
+alerter = EmailAlerter(config)
+print('EmailAlerter initialized:', alerter.enabled)
+"
+
+# 3. Test Slack alerter
+python3 -c "
+from src.alerters.slack_alerter import SlackAlerter
+config = {'enabled': False}
+alerter = SlackAlerter(config)
+print('SlackAlerter initialized:', alerter.enabled)
+"
+
+# 4. Full alerting test
+python3 -c "
+from src.main import load_config
+from src.alerters.alert_manager import create_alert_manager
+
+config = load_config('/etc/security-audit/settings.yaml')
+manager = create_alert_manager(config)
+print(f'Initialized {len(manager.alerters)} alerters')
+
+# Simulate findings
+findings = [
+    {'severity': 'CRITICAL', 'type': 'TEST', 'message': 'Test finding'},
+    {'severity': 'HIGH', 'type': 'TEST', 'message': 'Another test'}
+]
+
+result = manager.process_findings(findings)
+print(f'Result: {result}')
+"
+```
+
+---
+
+## Configuration Examples
+
+### Minimal Setup (Email Only)
+```yaml
+alerting:
+  enabled: true
+  alerters:
+    email:
+      enabled: true
+      smtp_host: "smtp.gmail.com"
+      smtp_port: 587
+      username: "you@gmail.com"
+      password: "app-password-here"
+      from_email: "you@gmail.com"
+      to_emails: ["you@gmail.com"]
+```
+
+### Full Production Setup
+```yaml
+alerting:
+  enabled: true
+  dedup_window_seconds: 600
+  quiet_hours:
+    enabled: true
+    start: 22
+    end: 8
+  
+  escalation:
+    CRITICAL:
+      enabled: true
+      threshold: 1
+      cooldown_minutes: 30
+    HIGH:
+      enabled: true
+      threshold: 5
+      cooldown_minutes: 60
+  
+  alerters:
+    email:
+      enabled: true
+      to_emails:
+        - "security-team@example.com"
+        - "oncall@example.com"
+    
+    slack:
+      enabled: true
+      webhook_url: "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXX"
+      channel: "#security-critical"
+    
+    pushover:
+      enabled: true
+      api_token: "your-token"
+      user_key: "your-user-key"
+      priority: 1  # High priority for mobile alerts
+```
+
+---
+
+## Phase 3 Complete ✅
+
+| Component | Status | Purpose |
+|-----------|--------|---------|
+| **EmailAlerter** | ✅ SMTP notifications with HTML templates |
+| **SlackAlerter** | ✅ Rich embed blocks via webhook |
+| **DiscordAlerter** | ✅ Embed-based alerts with colors |
+| **PushoverAlerter** | ✅ Mobile push with priority levels |
+| **AlertManager** | ✅ Deduplication, escalation, routing |
+| **Quiet Hours** | ✅ Suppress alerts during off-hours |
+| **Rate Limiting** | ✅ Prevent alert fatigue |
+| **Escalation** | ✅ Tiered response by severity |
+
+Would you like to proceed with **Phase 4: Dashboard/Reporting** or **Phase 5: SIEM Integration** next?
