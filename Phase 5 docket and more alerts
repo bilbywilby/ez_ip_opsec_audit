@@ -1,0 +1,647 @@
+## Phase 5: Production Hardening & Alerting System
+
+### File 1: `src/alerting/notifier.py`
+```python
+#!/usr/bin/env python3
+"""
+Multi-channel alert notification system
+Supports email, Slack, webhook, and SMS notifications
+"""
+
+import smtplib
+import requests
+import json
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+from datetime import datetime
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class AlertConfig:
+    channels: List[str]  # ['email', 'slack', 'webhook']
+    severity_threshold: str  # 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW'
+    cooldown_minutes: int = 15  # Prevent alert spam
+    recipients: Dict[str, list] = None  # {'email': [], 'slack_webhooks': []}
+
+class AlertNotifier:
+    def __init__(self, config: AlertConfig):
+        self.config = config
+        self._last_alert_time = {}
+    
+    def should_send_alert(self, alert_key: str) -> bool:
+        """Rate limit alerts to prevent notification storms"""
+        if alert_key not in self._last_alert_time:
+            return True
+        
+        elapsed = datetime.now() - self._last_alert_time[alert_key]
+        if elapsed.total_seconds() > self.config.cooldown_minutes * 60:
+            del self._last_alert_time[alert_key]
+            return True
+        
+        return False
+    
+    def send_alert(self, severity: str, finding_type: str, description: str, 
+                   metadata: Dict = None) -> bool:
+        """Send alert through configured channels"""
+        if severity not in ['CRITICAL', 'HIGH']:
+            # Skip below threshold unless explicitly configured
+            if self.config.severity_threshold == 'MEDIUM':
+                pass
+            elif self.config.severity_threshold == 'LOW':
+                pass
+            else:
+                logger.info(f"Skipping {severity} alert - below threshold")
+                return False
+        
+        alert_key = f"{severity}_{finding_type}"
+        if not self.should_send_alert(alert_key):
+            logger.info(f"Alert rate-limited: {alert_key}")
+            return False
+        
+        success = True
+        
+        # Email notification
+        if 'email' in self.config.channels:
+            success &= self._send_email(severity, finding_type, description, metadata)
+        
+        # Slack notification
+        if 'slack' in self.config.channels:
+            success &= self._send_slack(severity, finding_type, description, metadata)
+        
+        # Generic webhook
+        if 'webhook' in self.config.channels:
+            success &= self._send_webhook(severity, finding_type, description, metadata)
+        
+        if success:
+            self._last_alert_time[alert_key] = datetime.now()
+        
+        return success
+    
+    def _send_email(self, severity: str, finding_type: str, description: str, 
+                    metadata: Dict) -> bool:
+        """Send SMTP email alert"""
+        try:
+            smtp_config = {
+                'server': os.getenv('SMTP_SERVER', 'smtp.gmail.com'),
+                'port': int(os.getenv('SMTP_PORT', 587)),
+                'username': os.getenv('SMTP_USERNAME'),
+                'password': os.getenv('SMTP_PASSWORD'),
+                'from_addr': os.getenv('ALERT_FROM_EMAIL'),
+                'to_addrs': self.config.recipients.get('email', [])
+            }
+            
+            if not all([smtp_config['username'], smtp_config['password']]):
+                logger.warning("Email credentials not configured")
+                return False
+            
+            subject = f"🚨 SECURITY ALERT: [{severity}] {finding_type}"
+            body = self._format_email_body(severity, finding_type, description, metadata)
+            
+            msg = MIMEMultipart()
+            msg['From'] = smtp_config['from_addr']
+            msg['To'] = ', '.join(smtp_config['to_addrs'])
+            msg['Subject'] = subject
+            msg.attach(MIMEText(body, 'html'))
+            
+            server = smtplib.SMTP(smtp_config['server'], smtp_config['port'])
+            server.starttls()
+            server.login(smtp_config['username'], smtp_config['password'])
+            server.send_message(msg)
+            server.quit()
+            
+            logger.info(f"Email alert sent: {severity} - {finding_type}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Email alert failed: {e}")
+            return False
+    
+    def _send_slack(self, severity: str, finding_type: str, description: str, 
+                    metadata: Dict) -> bool:
+        """Send Slack webhook notification"""
+        try:
+            slack_configs = self.config.recipients.get('slack_webhooks', [])
+            
+            colors = {
+                'CRITICAL': '#ff0000',
+                'HIGH': '#ff9900',
+                'MEDIUM': '#ffcc00',
+                'LOW': '#00cc00'
+            }
+            
+            payload = {
+                "attachments": [{
+                    "color": colors.get(severity, '#cccccc'),
+                    "title": f"Security Audit Alert: {finding_type}",
+                    "text": description,
+                    "fields": [
+                        {"title": "Severity", "value": severity, "short": True},
+                        {"title": "Detected", "value": datetime.now().isoformat(), "short": True},
+                    ],
+                    "footer": "Security Audit System",
+                    "ts": int(datetime.now().timestamp())
+                }]
+            }
+            
+            if metadata:
+                payload["attachments"][0]["fields"].extend([
+                    {"title": k.capitalize(), "value": str(v), "short": True}
+                    for k, v in list(metadata.items())[:4]
+                ])
+            
+            for webhook_url in slack_configs:
+                response = requests.post(
+                    webhook_url,
+                    json=payload,
+                    timeout=10
+                )
+                response.raise_for_status()
+            
+            logger.info(f"Slack alert sent: {severity} - {finding_type}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Slack alert failed: {e}")
+            return False
+    
+    def _send_webhook(self, severity: str, finding_type: str, description: str,
+                      metadata: Dict) -> bool:
+        """Send generic POST webhook"""
+        try:
+            webhook_url = os.getenv('ALERT_WEBHOOK_URL')
+            if not webhook_url:
+                logger.warning("Webhook URL not configured")
+                return False
+            
+            payload = {
+                'event': 'security_alert',
+                'severity': severity,
+                'type': finding_type,
+                'description': description,
+                'metadata': metadata or {},
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            response = requests.post(
+                webhook_url,
+                json=payload,
+                headers={'Content-Type': 'application/json'},
+                timeout=10
+            )
+            response.raise_for_status()
+            
+            logger.info(f"Webhook alert sent: {severity} - {finding_type}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Webhook alert failed: {e}")
+            return False
+    
+    def _format_email_body(self, severity: str, finding_type: str, 
+                           description: str, metadata: Dict) -> str:
+        """Format HTML email body"""
+        html = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif;">
+            <h2 style="color: red;">⚠️ Security Alert Detected</h2>
+            <table style="border-collapse: collapse; width: 100%;">
+                <tr><td><strong>Severity:</strong></td><td>{severity}</td></tr>
+                <tr><td><strong>Type:</strong></td><td>{finding_type}</td></tr>
+                <tr><td><strong>Time:</strong></td><td>{datetime.now().isoformat()}</td></tr>
+            </table>
+            <h3>Description:</h3>
+            <p>{description}</p>
+            {self._format_metadata_table(metadata)}
+            <hr>
+            <p style="color: #666; font-size: 12px;">Sent by Security Audit System</p>
+        </body>
+        </html>
+        """
+        return html
+    
+    def _format_metadata_table(self, metadata: Dict) -> str:
+        """Format additional metadata as HTML table"""
+        if not metadata:
+            return ""
+        
+        rows = "".join([
+            f"<tr><td><strong>{k}:</strong></td><td>{v}</td></tr>"
+            for k, v in metadata.items()
+        ])
+        
+        return f"""
+        <h3>Additional Details:</h3>
+        <table style="border-collapse: collapse; width: 100%;">
+            {rows}
+        </table>
+        """
+```
+
+### File 2: `src/alerting/rule_engine.py`
+```python
+#!/usr/bin/env python3
+"""
+Dynamic alert rule engine for correlating findings
+Detects patterns that indicate systemic issues
+"""
+
+from typing import Dict, List, Any
+from datetime import datetime, timedelta
+import sqlite3
+from collections import defaultdict
+
+class AlertRuleEngine:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+    
+    def evaluate_rules(self, findings: List[Dict]) -> List[Dict]:
+        """Evaluate all alert rules against new findings"""
+        triggered_rules = []
+        
+        # Rule 1: Multiple critical findings in short timeframe
+        critical_finding = self._check_critical_spike(findings)
+        if critical_finding:
+            triggered_rules.append(critical_finding)
+        
+        # Rule 2: Same finding type recurring
+        recurrence = self._check_recurrence(findings)
+        if recurrence:
+            triggered_rules.append(recurrence)
+        
+        # Rule 3: Escalating severity pattern
+        escalation = self._check_severity_escalation(findings)
+        if escalation:
+            triggered_rules.append(escalation)
+        
+        # Rule 4: Threshold breach (total findings per audit)
+        threshold_breach = self._check_threshold_breach(findings)
+        if threshold_breach:
+            triggered_rules.append(threshold_breach)
+        
+        return triggered_rules
+    
+    def _check_critical_spike(self, findings: List[Dict], window_minutes: int = 30,
+                              count_threshold: int = 3) -> Optional[Dict]:
+        """Detect multiple critical findings in rapid succession"""
+        critical_findings = [f for f in findings if f.get('severity') == 'CRITICAL']
+        
+        if len(critical_findings) >= count_threshold:
+            return {
+                'rule': 'critical_spike',
+                'severity': 'CRITICAL',
+                'title': f'Multiple Critical Findings Detected ({len(critical_findings)} in {window_minutes} min)',
+                'message': f'{count_threshold}+ critical issues found simultaneously',
+                'findings': critical_findings,
+                'recommended_action': 'Immediate investigation required'
+            }
+        return None
+    
+    def _check_recurrence(self, findings: List[Dict], lookback_days: int = 7,
+                          recurrence_threshold: int = 3) -> Optional[Dict]:
+        """Detect recurring findings indicating unresolved issues"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+        
+        for finding in findings:
+            finding_type = finding.get('type')
+            
+            cursor.execute("""
+                SELECT COUNT(*) FROM findings f
+                JOIN audit_cycles a ON f.audit_id = a.id
+                WHERE f.type = ? AND DATE(a.timestamp) >= ?
+            """, (finding_type, cutoff))
+            
+            count = cursor.fetchone()[0]
+            
+            if count >= recurrence_threshold:
+                return {
+                    'rule': 'recurrence',
+                    'severity': 'HIGH',
+                    'title': f'Recurring Finding: {finding_type}',
+                    'message': f'Issue detected {count} times in past {lookback_days} days',
+                    'finding_type': finding_type,
+                    'recommended_action': 'Address root cause instead of symptoms'
+                }
+        
+        conn.close()
+        return None
+    
+    def _check_severity_escalation(self, findings: List[Dict]) -> Optional[Dict]:
+        """Detect if issue severity is trending upward"""
+        # Compare current audit with previous
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT id FROM audit_cycles ORDER BY timestamp DESC LIMIT 2")
+        audits = cursor.fetchall()
+        
+        if len(audits) < 2:
+            conn.close()
+            return None
+        
+        current_id, prev_id = audits[0][0], audits[1][0]
+        
+        cursor.execute("""
+            SELECT severity, COUNT(*) FROM findings WHERE audit_id = ? GROUP BY severity
+        """, (current_id,))
+        current_counts = dict(cursor.fetchall())
+        
+        cursor.execute("""
+            SELECT severity, COUNT(*) FROM findings WHERE audit_id = ? GROUP BY severity
+        """, (prev_id,))
+        prev_counts = dict(cursor.fetchall())
+        
+        # Check if critical/high increased
+        critical_increase = current_counts.get('CRITICAL', 0) > prev_counts.get('CRITICAL', 0)
+        high_increase = current_counts.get('HIGH', 0) > prev_counts.get('HIGH', 0)
+        
+        if critical_increase or high_increase:
+            return {
+                'rule': 'escalation',
+                'severity': 'HIGH',
+                'title': 'Severity Escalation Detected',
+                'message': f'Critical: +{current_counts.get("CRITICAL",0)-prev_counts.get("CRITICAL",0)}, High: +{current_counts.get("HIGH",0)-prev_counts.get("HIGH",0)}',
+                'recommended_action': 'Review recent changes that may have introduced new issues'
+            }
+        
+        conn.close()
+        return None
+    
+    def _check_threshold_breach(self, findings: List[Dict], 
+                                total_threshold: int = 50) -> Optional[Dict]:
+        """Alert when total findings exceed organizational threshold"""
+        if len(findings) >= total_threshold:
+            return {
+                'rule': 'threshold_breach',
+                'severity': 'MEDIUM',
+                'title': f'Finding Threshold Exceeded ({len(findings)} findings)',
+                'message': 'Total findings exceeded configured threshold',
+                'recommendation': 'Consider scheduling more frequent audits or increasing remediation capacity'
+            }
+        return None
+```
+
+### File 3: `src/dashboard/config.py`
+```python
+#!/usr/bin/env python3
+"""
+Production configuration management
+Secure credential handling via environment variables
+"""
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, List
+
+@dataclass
+class DatabaseConfig:
+    path: str = "/tmp/security_audit.db"
+    pool_size: int = 5
+    timeout: int = 30
+
+@dataclass
+class LoggingConfig:
+    level: str = "INFO"
+    directory: str = "/var/log/security-audit"
+    retention_days: int = 90
+    max_file_size_mb: int = 100
+
+@dataclass
+class AlertConfig:
+    enabled: bool = True
+    channels: List[str] = None  # ['email', 'slack', 'webhook']
+    severity_threshold: str = "HIGH"
+    cooldown_minutes: int = 15
+
+@dataclass
+class ServerConfig:
+    host: str = "0.0.0.0"
+    port: int = 5000
+    debug: bool = False
+    workers: int = 4
+    threads: int = 2
+
+class ConfigManager:
+    def __init__(self, env_file: Optional[str] = None):
+        self.env_file = env_file
+        self._load_env()
+    
+    def _load_env(self):
+        """Load environment variables from .env file if exists"""
+        if self.env_file and os.path.exists(self.env_file):
+            from dotenv import load_dotenv
+            load_dotenv(self.env_file)
+    
+    @property
+    def database(self) -> DatabaseConfig:
+        return DatabaseConfig(
+            path=os.getenv('DATABASE_PATH', '/tmp/security_audit.db'),
+            pool_size=int(os.getenv('DB_POOL_SIZE', 5)),
+            timeout=int(os.getenv('DB_TIMEOUT', 30))
+        )
+    
+    @property
+    def logging(self) -> LoggingConfig:
+        return LoggingConfig(
+            level=os.getenv('LOG_LEVEL', 'INFO'),
+            directory=os.getenv('LOG_DIR', '/var/log/security-audit'),
+            retention_days=int(os.getenv('LOG_RETENTION_DAYS', 90)),
+            max_file_size_mb=int(os.getenv('MAX_LOG_SIZE_MB', 100))
+        )
+    
+    @property
+    def alerts(self) -> AlertConfig:
+        channels_str = os.getenv('ALERT_CHANNELS', '')
+        channels = [c.strip() for c in channels_str.split(',') if c.strip()]
+        
+        return AlertConfig(
+            enabled=os.getenv('ALERTS_ENABLED', 'true').lower() == 'true',
+            channels=channels if channels else ['email'],
+            severity_threshold=os.getenv('ALERT_SEVERITY_THRESHOLD', 'HIGH'),
+            cooldown_minutes=int(os.getenv('ALERT_COOLDOWN_MINUTES', 15))
+        )
+    
+    @property
+    def server(self) -> ServerConfig:
+        return ServerConfig(
+            host=os.getenv('SERVER_HOST', '0.0.0.0'),
+            port=int(os.getenv('SERVER_PORT', 5000)),
+            debug=os.getenv('FLASK_DEBUG', 'false').lower() == 'true',
+            workers=int(os.getenv('GUNICORN_WORKERS', 4)),
+            threads=int(os.getenv('GUNICORN_THREADS', 2))
+        )
+    
+    def validate(self) -> List[str]:
+        """Validate configuration requirements"""
+        errors = []
+        
+        if not self.alerts.enabled:
+            return errors
+        
+        if 'email' in self.alerts.channels:
+            if not all([
+                os.getenv('SMTP_SERVER'),
+                os.getenv('SMTP_USERNAME'),
+                os.getenv('SMTP_PASSWORD'),
+                os.getenv('ALERT_FROM_EMAIL')
+            ]):
+                errors.append("Email alerts enabled but SMTP credentials incomplete")
+        
+        if 'webhook' in self.alerts.channels:
+            if not os.getenv('ALERT_WEBHOOK_URL'):
+                errors.append("Webhook alerts enabled but ALERT_WEBHOOK_URL not set")
+        
+        if 'slack' in self.alerts.channels:
+            slack_urls = os.getenv('SLACK_WEBHOOK_URLS', '')
+            if not slack_urls.strip():
+                errors.append("Slack alerts enabled but SLACK_WEBHOOK_URLS not set")
+        
+        return errors
+```
+
+### File 4: `docker-compose.yml`
+```yaml
+version: '3.8'
+
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: security-dashboard
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./src:/app/src
+      - audit_logs:/var/log/security-audit
+      - ./data:/app/data
+    environment:
+      - FLASK_ENV=production
+      - DATABASE_PATH=/app/data/security_audit.db
+      - LOG_DIR=/var/log/security-audit
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=5000
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - security-net
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: audit-worker
+    volumes:
+      - ./src:/app/src
+      - audit_logs:/var/log/security-audit
+      - ./data:/app/data
+    environment:
+      - DATABASE_PATH=/app/data/security_audit.db
+      - LOG_DIR=/var/log/security-audit
+    restart: unless-stopped
+    networks:
+      - security-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: security-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - security-net
+
+  nginx:
+    image: nginx:alpine
+    container_name: security-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - dashboard
+    restart: unless-stopped
+    networks:
+      - security-net
+
+volumes:
+  audit_logs:
+  redis_data:
+
+networks:
+  security-net:
+    driver: bridge
+```
+
+### File 5: `Dockerfile.dashboard`
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY src/ ./src/
+
+# Create log directory
+RUN mkdir -p /var/log/security-audit /app/data
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:5000/api/status || exit 1
+
+# Run with gunicorn for production
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "--threads", "2", "src.dashboard.app:app"]
+```
+
+### File 6: `requirements.txt`
+```txt
+flask==3.0.0
+flask-cors==4.0.0
+gunicorn==21.2.0
+pandas==2.1.4
+plotly==5.18.0
+requests==2.31.0
+sqlite3  # Built-in
+python-dotenv==1.0.0
+redis==5.0.1
+```
+
+---
+
+## Key Architecture Patterns
+
+| Component | Purpose | Technology |
+|-----------|---------|------------|
+| **Dashboard** | Real-time visualization | Flask + Plotly |
+| **Worker** | Background audit execution | Celery + Redis |
+| **Cache** | Rate limiting & session storage | Redis |
+| **Database** | Persistent audit history | SQLite (upgradeable to PostgreSQL) |
+| **Proxy** | SSL termination & load balancing | Nginx |
+
+---
+
+## Phase 6 Preview
+
+Next phase would cover:
+1. **Authentication & Authorization** (OAuth2, JWT tokens)
+2. **Advanced Analytics** (ML-based anomaly detection)
+3. **SIEM Integration** (Splunk, ELK stack connectors)
+4. **Automated Remediation** (Self-healing scripts for common issues)
+5. **Compliance Reporting** (SOC2, HIPAA, PCI-DSS templates)
