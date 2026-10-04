@@ -637,6 +637,642 @@ redis==5.0.1
 
 ---
 
+## Phase 5: Advanced Architecture & Production Hardening
+
+### ⚠️ Critical Security Fixes Needed First
+
+```python
+# In app.py - FIX THESE IMMEDIATELY:
+
+# BAD (Line ~174): SQL injection vulnerability
+query += f" WHERE f.severity = '{severity}'"
+
+# GOOD: Parameterized queries
+if severity:
+    query += " WHERE f.severity = ?"
+    params.append(severity)
+
+cursor.execute(query, params)
+```
+
+**Additional fixes:**
+- Add authentication layer before exposing to networks
+- Disable `debug=False` in production (already done ✓)
+- Validate file paths in `report_latest()` against directory traversal
+- Add rate limiting to prevent API abuse
+
+---
+
+### File 3: `src/dashboard/config.py` (Configuration Management)
+
+```python
+#!/usr/bin/env python3
+"""
+Secure configuration management with environment variable support
+"""
+
+from dataclasses import dataclass
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+@dataclass
+class DatabaseConfig:
+    path: str = "/tmp/security_audit.db"
+    connection_pool_size: int = 5
+    timeout: float = 30.0
+
+@dataclass
+class SecurityConfig:
+    jwt_secret_key: str = os.getenv("JWT_SECRET_KEY", "change-me-in-production")
+    token_expiry_hours: int = 24
+    max_login_attempts: int = 5
+    lockout_duration_minutes: int = 30
+    enable_rate_limiting: bool = True
+    rate_limit_requests: int = 100
+    rate_limit_window_seconds: int = 60
+
+@dataclass
+class NotificationConfig:
+    slack_webhook_url: str = os.getenv("SLACK_WEBHOOK_URL", "")
+    email_smtp_server: str = os.getenv("SMTP_SERVER", "")
+    email_port: int = int(os.getenv("SMTP_PORT", 587))
+    email_username: str = os.getenv("SMTP_USER", "")
+    email_password: str = os.getenv("SMTP_PASSWORD", "")
+    critical_alert_threshold: int = 1  # Number of critical findings triggering alert
+
+@dataclass 
+class LoggingConfig:
+    level: str = os.getenv("LOG_LEVEL", "INFO")
+    log_dir: str = "/var/log/security-audit-dashboard"
+    max_log_size_mb: int = 100
+    backup_count: int = 5
+
+@dataclass
+class DashboardConfig:
+    host: str = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+    port: int = int(os.getenv("DASHBOARD_PORT", 5000))
+    cors_origins: list = None
+    enable_https: bool = False
+    ssl_cert_path: str = os.getenv("SSL_CERT_PATH", "")
+    ssl_key_path: str = os.getenv("SSL_KEY_PATH", "")
+    
+    def __post_init__(self):
+        if self.cors_origins is None:
+            self.cors_origins = ["http://localhost:3000"]
+
+class ConfigManager:
+    """Centralized configuration with validation"""
+    
+    def __init__(self):
+        self.database = DatabaseConfig()
+        self.security = SecurityConfig()
+        self.notifications = NotificationConfig()
+        self.logging = LoggingConfig()
+        self.dashboard = DashboardConfig()
+        
+        self._validate_config()
+    
+    def _validate_config(self):
+        """Validate sensitive configurations"""
+        if self.security.jwt_secret_key == "change-me-in-production":
+            raise ValueError("⚠️ JWT_SECRET_KEY must be changed in production!")
+        
+        if self.dashboard.enable_https:
+            if not self.dashboard.ssl_cert_path or not self.dashboard.ssl_key_path:
+                raise ValueError("HTTPS enabled but SSL certificates not configured")
+    
+    @staticmethod
+    def generate_secret_key(length: int = 32) -> str:
+        """Generate cryptographically secure secret key"""
+        import secrets
+        return secrets.token_hex(length)
+```
+
+---
+
+### File 4: `src/dashboard/auth.py` (Authentication Middleware)
+
+```python
+#!/usr/bin/env python3
+"""
+JWT-based authentication for dashboard access
+"""
+
+from functools import wraps
+from flask import request, jsonify, g
+import jwt
+import hashlib
+from datetime import datetime, timedelta
+from config import ConfigManager
+
+config = ConfigManager()
+
+class UserAuth:
+    """Simple user authentication with password hashing"""
+    
+    def __init__(self):
+        self.users = {}  # Replace with database in production
+        self.failed_attempts = {}
+    
+    def register_user(self, username: str, password: str) -> bool:
+        """Register new user with hashed password"""
+        if username in self.users:
+            return False
+        
+        salt = hashlib.sha256(str(datetime.now()).encode()).hexdigest()[:16]
+        hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+        
+        self.users[username] = {
+            'password_hash': hashed.hex(),
+            'salt': salt,
+            'created_at': datetime.now().isoformat()
+        }
+        return True
+    
+    def verify_credentials(self, username: str, password: str) -> tuple:
+        """Verify login credentials, returns (success, message)"""
+        if username not in self.users:
+            return False, "Invalid credentials"
+        
+        # Check account lockout
+        if self._is_locked_out(username):
+            return False, "Account locked due to too many failed attempts"
+        
+        user = self.users[username]
+        salt = user['salt']
+        test_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+        
+        if test_hash.hex() != user['password_hash']:
+            self._record_failed_attempt(username)
+            return False, "Invalid credentials"
+        
+        # Clear failed attempts on success
+        self.failed_attempts.pop(username, None)
+        return True, "Login successful"
+    
+    def _is_locked_out(self, username: str) -> bool:
+        """Check if user is temporarily locked out"""
+        if username not in self.failed_attempts:
+            return False
+        
+        last_attempt = self.failed_attempts[username]['last_attempt']
+        failures = self.failed_attempts[username]['count']
+        
+        if failures >= config.security.max_login_attempts:
+            lockout_end = last_attempt + timedelta(minutes=config.security.lockout_duration_minutes)
+            if datetime.now() < lockout_end:
+                return True
+        
+        return False
+    
+    def _record_failed_attempt(self, username: str):
+        """Record failed login attempt"""
+        if username not in self.failed_attempts:
+            self.failed_attempts[username] = {'count': 1, 'last_attempt': datetime.now()}
+        else:
+            self.failed_attempts[username]['count'] += 1
+            self.failed_attempts[username]['last_attempt'] = datetime.now()
+    
+    def generate_token(self, username: str) -> str:
+        """Generate JWT token for authenticated user"""
+        payload = {
+            'sub': username,
+            'iat': datetime.now(),
+            'exp': datetime.now() + timedelta(hours=config.security.token_expiry_hours)
+        }
+        return jwt.encode(payload, config.security.jwt_secret_key, algorithm='HS256')
+    
+    def validate_token(self, token: str) -> dict:
+        """Validate JWT token and return decoded payload"""
+        try:
+            payload = jwt.decode(token, config.security.jwt_secret_key, algorithms=['HS256'])
+            return payload
+        except jwt.ExpiredSignatureError:
+            return {'error': 'Token expired'}
+        except jwt.InvalidTokenError:
+            return {'error': 'Invalid token'}
+
+# Global auth instance
+auth = UserAuth()
+
+def login_required(f):
+    """Decorator to protect routes requiring authentication"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        token = None
+        
+        # Get token from header
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            if auth_header.startswith('Bearer '):
+                token = auth_header[7:]
+        
+        if not token:
+            return jsonify({'error': 'Missing authentication token'}), 401
+        
+        payload = auth.validate_token(token)
+        
+        if 'error' in payload:
+            return jsonify({'error': payload['error']}), 401
+        
+        g.current_user = payload['sub']
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+def rate_limit(f):
+    """Rate limiting decorator"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not config.security.enable_rate_limiting:
+            return f(*args, **kwargs)
+        
+        client_ip = request.remote_addr
+        cache_key = f"rate_limit:{client_ip}:{request.endpoint}"
+        
+        # Simple in-memory rate limiting (use Redis in production)
+        from flask_caching import Cache
+        cache = Cache(app.config={'CACHE_TYPE': 'simple'})
+        
+        request_count = cache.get(cache_key) or 0
+        
+        if request_count >= config.security.rate_limit_requests:
+            return jsonify({'error': 'Rate limit exceeded'}), 429
+        
+        cache.set(cache_key, request_count + 1, timeout=config.security.rate_limit_window_seconds)
+        return f(*args, **kwargs)
+    
+    return decorated_function
+```
+
+---
+
+### File 5: `src/alerting/notifier.py` (Alert System)
+
+```python
+#!/usr/bin/env python3
+"""
+Multi-channel alert notification system
+"""
+
+import smtplib
+import requests
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import List, Optional
+from config import ConfigManager
+from datetime import datetime
+import json
+
+config = ConfigManager()
+
+class AlertSeverity:
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+class Notifier:
+    """Unified notification dispatcher"""
+    
+    def __init__(self):
+        self.channels = []
+        self._setup_channels()
+    
+    def _setup_channels(self):
+        """Initialize notification channels based on configuration"""
+        if config.notifications.slack_webhook_url:
+            self.channels.append(SlackNotifier(config.notifications.slack_webhook_url))
+        
+        if config.notifications.email_smtp_server:
+            self.channels.append(EmailNotifier(
+                config.notifications.email_smtp_server,
+                config.notifications.email_port,
+                config.notifications.email_username,
+                config.notifications.email_password
+            ))
+    
+    def send_alert(self, severity: str, title: str, message: str, 
+                   metadata: Optional[dict] = None):
+        """Send alert to all configured channels"""
+        results = []
+        
+        for channel in self.channels:
+            try:
+                result = channel.send(severity, title, message, metadata)
+                results.append({
+                    'channel': channel.__class__.__name__,
+                    'success': True,
+                    'result': result
+                })
+            except Exception as e:
+                results.append({
+                    'channel': channel.__class__.__name__,
+                    'success': False,
+                    'error': str(e)
+                })
+        
+        return results
+    
+    def check_and_alert_findings(self, audit_data: dict):
+        """Analyze audit data and trigger alerts based on thresholds"""
+        critical_count = audit_data.get('critical_count', 0)
+        
+        if critical_count >= config.notifications.critical_alert_threshold:
+            self.send_alert(
+                AlertSeverity.CRITICAL,
+                "Critical Security Findings Detected",
+                f"Audit detected {critical_count} critical issue(s) requiring immediate attention",
+                audit_data
+            )
+
+class SlackNotifier:
+    """Slack webhook integration"""
+    
+    def __init__(self, webhook_url: str):
+        self.webhook_url = webhook_url
+    
+    def send(self, severity: str, title: str, message: str, metadata: dict = None) -> dict:
+        """Send formatted Slack message"""
+        color_map = {
+            AlertSeverity.CRITICAL: "#ff0000",
+            AlertSeverity.HIGH: "#ff9900",
+            AlertSeverity.MEDIUM: "#ffff00",
+            AlertSeverity.LOW: "#00ff00"
+        }
+        
+        payload = {
+            "attachments": [{
+                "color": color_map.get(severity, "#808080"),
+                "title": f"[{severity}] {title}",
+                "text": message,
+                "footer": "Security Audit Dashboard",
+                "ts": int(datetime.now().timestamp())
+            }]
+        }
+        
+        if metadata:
+            fields = [{"title": k, "value": str(v)[:200], "short": True} 
+                     for k, v in metadata.items()][:5]
+            payload["attachments"][0]["fields"] = fields
+        
+        response = requests.post(self.webhook_url, json=payload, timeout=10)
+        response.raise_for_status()
+        return {'slack_response_code': response.status_code}
+
+class EmailNotifier:
+    """SMTP email notifications"""
+    
+    def __init__(self, smtp_server: str, port: int, username: str, password: str):
+        self.smtp_server = smtp_server
+        self.port = port
+        self.username = username
+        self.password = password
+        self.recipients = [os.getenv("ALERT_EMAIL", "admin@example.com")]
+    
+    def send(self, severity: str, title: str, message: str, metadata: dict = None) -> dict:
+        """Send email alert"""
+        msg = MIMEMultipart()
+        msg['Subject'] = f"🚨 {severity} - {title}"
+        msg['From'] = self.username
+        msg['To'] = ", ".join(self.recipients)
+        
+        body = f"""
+Security Alert - {severity.upper()}
+
+Title: {title}
+Time: {datetime.now().isoformat()}
+
+Details:
+{message}
+
+{'--- Metadata ---' if metadata else ''}
+{json.dumps(metadata, indent=2) if metadata else ''}
+
+---
+Generated by Security Audit Dashboard
+        """
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        with smtplib.SMTP(self.smtp_server, self.port) as server:
+            server.starttls()
+            server.login(self.username, self.password)
+            server.send_message(msg)
+        
+        return {'email_sent': True, 'recipient_count': len(self.recipients)}
+
+# Global notifier instance
+notifier = Notifier()
+```
+
+---
+
+### File 6: `src/scheduler/cron_scheduler.py` (Automated Scheduling)
+
+```python
+#!/usr/bin/env python3
+"""
+Scheduled audit execution using APScheduler
+"""
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
+import logging
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from audit_runner import run_full_security_audit
+from alerting.notifier import notifier
+from dashboard.app import populate_db_from_logs
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class AuditScheduler:
+    """Manage automated audit scheduling"""
+    
+    def __init__(self):
+        self.scheduler = BackgroundScheduler()
+        self._setup_event_listeners()
+    
+    def _setup_event_listeners(self):
+        """Register job event handlers"""
+        self.scheduler.add_listener(
+            self._job_executed,
+            EVENT_JOB_EXECUTED
+        )
+        self.scheduler.add_listener(
+            self._job_error,
+            EVENT_JOB_ERROR
+        )
+    
+    def _job_executed(self, event):
+        """Handle successful job completion"""
+        logger.info(f"Job {event.job_id} executed successfully")
+        populate_db_from_logs()  # Sync with dashboard
+    
+    def _job_error(self, event):
+        """Handle job errors with alerting"""
+        logger.error(f"Job {event.job_id} failed")
+        notifier.send_alert(
+            "CRITICAL",
+            "Audit Scheduler Job Failed",
+            f"Job {event.job_id} encountered an error",
+            {'exception': str(event.exception)}
+        )
+    
+    def schedule_audit(self, cron_expression: str = "0 * * * *"):
+        """Schedule regular audit runs (default: hourly)"""
+        self.scheduler.add_job(
+            run_full_security_audit,
+            CronTrigger.from_crontab(cron_expression),
+            id='scheduled_security_audit',
+            replace_existing=True,
+            max_instances=1
+        )
+        logger.info(f"Scheduled audit with cron: {cron_expression}")
+    
+    def start(self):
+        """Start the scheduler"""
+        self.scheduler.start()
+        logger.info("Audit scheduler started")
+    
+    def stop(self):
+        """Stop the scheduler"""
+        self.scheduler.shutdown(wait=False)
+        logger.info("Audit scheduler stopped")
+
+# Create global scheduler instance
+scheduler = AuditScheduler()
+```
+
+---
+
+### Deployment Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     PRODUCTION DEPLOYMENT                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐           │
+│  │ Load Balancer│───▶│ Flask App    │───▶│  PostgreSQL  │           │
+│  │   (nginx)    │◀───│  (Multiple)  │◀───│  Cluster     │           │
+│  └──────────────┘    └──────────────┘    └──────────────┘           │
+│         │                  │                    │                 │
+│         │                  │                    │                 │
+│         ▼                  ▼                    ▼                 │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐           │
+│  │   CDN/SSL    │    │    Redis     │    │   Audit      │           │
+│  │ Termination  │    │   (Cache)    │    │   Logs       │           │
+│  └──────────────┘    └──────────────┘    └──────────────┘           │
+│                                                                   │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐           │
+│  │   Cron Jobs  │───▶│   Notifier   │───▶│  Slack/Email │           │
+│  │ (APScheduler)│    │   Service    │    │   Channels   │           │
+│  └──────────────┘    └──────────────┘    └──────────────┘           │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Docker Compose Configuration
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  dashboard:
+    build: ./src/dashboard
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=production
+      - DATABASE_URL=postgresql://user:pass@db:5432/audit
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - audit_logs:/var/log/security-audit
+    restart: unless-stopped
+  
+  scheduler:
+    build: ./src/scheduler
+    environment:
+      - AUDIT_LOGS_PATH=/var/log/security-audit
+      - NOTIFICATION_CHANNELS=slack,email
+    depends_on:
+      - dashboard
+    volumes:
+      - audit_logs:/var/log/security-audit
+    restart: unless-stopped
+  
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - dashboard
+  
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=security_audit
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+  
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+
+volumes:
+  audit_logs:
+  postgres_data:
+  redis_data:
+```
+
+---
+
+### Summary Table: Architecture Comparison
+
+| Aspect | Current Design | Production-Ready |
+|--------|----------------|------------------|
+| **Database** | SQLite (single-user) | PostgreSQL (HA cluster) |
+| **Scaling** | Single Flask process | Multiple workers (gunicorn) |
+| **Caching** | In-memory | Redis distributed cache |
+| **Authentication** | Basic/None | JWT + OAuth2 integration |
+| **Rate Limiting** | None | Redis-backed per-client limits |
+| **Alerting** | None | Multi-channel (Slack, Email, PagerDuty) |
+| **Logging** | File-based | Centralized ELK stack |
+| **Deployment** | Manual script | Docker Compose/Kubernetes |
+| **Monitoring** | None | Prometheus + Grafana metrics |
+
+---
+
+### Recommended Next Steps
+
+1. **Immediate Security Fixes**: Patch SQL injection vulnerabilities before deployment
+2. **Choose Authentication Method**: Internal vs. SSO/OAuth integration
+3. **Database Migration**: Plan SQLite → PostgreSQL migration strategy
+4. **Infrastructure**: Decide on cloud provider (AWS/GCP/Azure) or on-premise
+5. **Compliance**: Ensure alignment with GDPR/SOC2 requirements if applicable
+
 ## Phase 6 Preview
 
 Next phase would cover:
