@@ -1,0 +1,1825 @@
+## Phase 7: Production Deployment Playbook & Disaster Recovery Procedures
+
+### File 15: `scripts/deploy.sh` (Deployment Automation Script)
+
+```bash
+#!/bin/bash
+# scripts/deploy.sh - Production Deployment Automation
+set -euo pipefail
+
+#-------------------------------------------------------------------------------
+# CONFIGURATION
+#-------------------------------------------------------------------------------
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly PROJECT_ROOT="${SCRIPT_DIR}/.."
+readonly DEPLOY_ENV="${DEPLOY_ENV:-production}"
+readonly DEPLOY_TIMEOUT="${DEPLOY_TIMEOUT:-300}"
+readonly HEALTH_CHECK_RETRIES="${HEALTH_CHECK_RETRIES:-5}"
+readonly HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-10}"
+
+# Environment-specific settings
+declare -A ENV_CONFIG
+ENV_CONFIG[staging]="staging.example.com deploy-user 80%"
+ENV_CONFIG[production]="prod.example.com deploy-user 90%"
+ENV_CONFIG[development]="localhost dev-user 100%"
+
+#-------------------------------------------------------------------------------
+# LOGGING
+#-------------------------------------------------------------------------------
+log() {
+    local level="$1"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*" | tee -a /var/log/security-audit/deploy.log
+}
+
+log_success() { log "✓" "$@"; }
+log_warning() { log "⚠" "$@"; }
+log_error() { log "✗" "$@" >&2; }
+
+#-------------------------------------------------------------------------------
+# PRE-DEPLOYMENT VALIDATIONS
+#-------------------------------------------------------------------------------
+pre_deploy_checks() {
+    log "INFO" "Running pre-deployment validation checks..."
+    
+    # Check 1: Git repository clean
+    if ! git diff-index --quiet HEAD --; then
+        log_error "Working directory has uncommitted changes"
+        log_warning "Please commit or stash changes before deploying"
+        return 1
+    fi
+    
+    # Check 2: Latest branch synced
+    log "INFO" "Fetching latest remote state..."
+    git fetch origin "${DEPLOY_ENV}"
+    local local_sha=$(git rev-parse HEAD)
+    local remote_sha=$(git rev-parse "origin/${DEPLOY_ENV}")
+    
+    if [[ "$local_sha" != "$remote_sha" ]]; then
+        log_warning "Local branch diverges from remote (${local_sha} vs ${remote_sha})"
+        log "INFO" "Deploying current commit anyway"
+    fi
+    
+    # Check 3: Database migrations ready
+    log "INFO" "Checking database migration readiness..."
+    if ! python3 -m scripts.migration_check --dry-run; then
+        log_error "Database migration checks failed"
+        return 1
+    fi
+    
+    # Check 4: Storage capacity
+    local usage_percent=$(df /var/log/security-audit | awk 'NR==2 {print $5}' | tr -d '%')
+    local max_usage="${ENV_CONFIG[${DEPLOY_ENV}]#* }"
+    
+    if (( usage_percent > ${max_usage%?} )); then
+        log_warning "Storage at ${usage_percent}% - exceeds recommended ${max_usage}"
+        log "INFO" "Proceeding but consider cleanup"
+    fi
+    
+    # Check 5: Required secrets present
+    if [[ -z "${SECRET_KEY:-}" ]] || [[ -z "${DATABASE_URL:-}" ]]; then
+        log_error "Required environment variables not set"
+        return 1
+    fi
+    
+    log_success "All pre-deployment checks passed"
+    return 0
+}
+
+#-------------------------------------------------------------------------------
+# DEPLOYMENT PROCESS
+#-------------------------------------------------------------------------------
+deploy_with_health_check() {
+    log "INFO" "Starting deployment procedure..."
+    
+    # Step 1: Stop old containers gracefully
+    log "INFO" "Stopping existing services..."
+    docker-compose down --timeout 60
+    log_success "Services stopped"
+    
+    # Step 2: Pull new images
+    log "INFO" "Pulling updated Docker images..."
+    docker-compose pull
+    log_success "Images pulled"
+    
+    # Step 3: Run database migrations (if any)
+    if [[ -n "$(git log --oneline -1 | grep -i migrate)" ]]; then
+        log "INFO" "Running database migrations..."
+        docker-compose run --rm app python3 manage.py migrate
+        log_success "Migrations completed"
+    fi
+    
+    # Step 4: Start services
+    log "INFO" "Starting new services..."
+    docker-compose up -d
+    
+    # Wait for services to initialize
+    sleep 10
+    log_success "Services started"
+    
+    # Step 5: Health check loop
+    log "INFO" "Running health checks (max ${HEALTH_CHECK_RETRIES} retries)..."
+    local retries=0
+    local success=false
+    
+    while (( retries < HEALTH_CHECK_RETRIES )); do
+        if curl -sf "https://${HOST}/api/health" > /dev/null; then
+            log_success "Health check passed on attempt $((retries + 1))"
+            success=true
+            break
+        fi
+        
+        log_warning "Health check failed, retrying in ${HEALTH_CHECK_INTERVAL}s..."
+        sleep "$HEALTH_CHECK_INTERVAL"
+        ((retries++))
+    done
+    
+    if [[ "$success" != "true" ]]; then
+        log_error "Health checks failed after ${HEALTH_CHECK_RETRIES} attempts"
+        rollback
+        return 1
+    fi
+    
+    # Step 6: Smoke tests
+    log "INFO" "Running smoke tests..."
+    if ! python3 -m scripts.smoke_tests; then
+        log_warning "Smoke tests had failures - review logs"
+    fi
+    
+    # Step 7: Archive deployment record
+    record_deployment
+    
+    log_success "Deployment completed successfully!"
+    
+    # Display summary
+    echo ""
+    echo "=========================================="
+    echo "         DEPLOYMENT SUMMARY              "
+    echo "=========================================="
+    echo "Environment:     ${DEPLOY_ENV^^}"
+    echo "Host:            ${HOST}"
+    echo "Commit:          $(git rev-parse HEAD)"
+    echo "Branch:          $(git branch --show-current)"
+    echo "Deployed by:     ${USER}@$(hostname)"
+    echo "Timestamp:       $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+    echo "=========================================="
+    
+    return 0
+}
+
+#-------------------------------------------------------------------------------
+# ROLLBACK PROCEDURE
+#-------------------------------------------------------------------------------
+rollback() {
+    log_error "Initiating rollback procedure..."
+    
+    # Get previous deployment tag
+    local prev_tag=$(docker images | grep "${IMAGE_NAME}" | awk 'NR==2 {print $3}')
+    
+    if [[ -z "$prev_tag" ]]; then
+        log_error "No previous image found - cannot rollback"
+        return 1
+    fi
+    
+    log "INFO" "Rolling back to tag: ${prev_tag}"
+    
+    # Stop current services
+    docker-compose down
+    
+    # Tag and restart with previous image
+    docker tag "${prev_tag}" "${IMAGE_NAME}:current"
+    docker-compose up -d
+    
+    # Verify rollback
+    sleep 10
+    if curl -sf "https://${HOST}/api/health"; then
+        log_success "Rollback completed successfully"
+    else
+        log_error "Rollback verification failed - manual intervention required"
+        # Trigger alert
+        python3 -m scripts.trigger_alert --severity=critical \
+            --title="Rollback Failed" \
+            --message="Automatic rollback to ${prev_tag} did not restore service"
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# DEPLOYMENT RECORDING
+#-------------------------------------------------------------------------------
+record_deployment() {
+    local deployment_record=$(cat <<EOF
+{
+    "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+    "environment": "${DEPLOY_ENV}",
+    "commit": "$(git rev-parse HEAD)",
+    "branch": "$(git branch --show-current)",
+    "deployed_by": "${USER}@$(hostname)",
+    "duration_seconds": ${SECONDS},
+    "images_deployed": "$(docker images --format '{{.Repository}}:{{.Tag}}' | tr '\n' ' ')",
+    "health_check_retries": ${retries:-0},
+    "status": "success"
+}
+EOF
+)
+    
+    echo "${deployment_record}" >> /var/log/security-audit/deployments.json
+    log "INFO" "Deployment record saved"
+}
+
+#-------------------------------------------------------------------------------
+# BLUE-GREEN DEPLOYMENT (Advanced)
+#-------------------------------------------------------------------------------
+blue_green_deploy() {
+    log "INFO" "Starting blue-green deployment..."
+    
+    local active_slot="${BLUE_GREEN_SLOT:-blue}"
+    local inactive_slot=$([[ "$active_slot" == "blue" ]] && echo "green" || echo "blue")
+    
+    # Build and tag for inactive slot
+    log "INFO" "Building and tagging ${inactive_slot} environment..."
+    docker-compose build
+    docker tag "${IMAGE_NAME}:${active_slot}" "${IMAGE_NAME}:${inactive_slot}"
+    
+    # Start inactive slot
+    BLUE_GREEN_SLOT="${inactive_slot}" docker-compose up -d
+    
+    # Warm up inactive environment
+    log "INFO" "Warming up ${inactive_slot} environment..."
+    for i in {1..5}; do
+        curl -sf "https://${HOST}/api/status" > /dev/null
+        sleep 2
+    done
+    
+    # Switch traffic (requires load balancer configuration)
+    log "INFO" "Switching traffic to ${inactive_slot}..."
+    update_load_balancer_target "${inactive_slot}"
+    
+    # Monitor for issues
+    if monitor_traffic_switch "${inactive_slot}"; then
+        log_success "Blue-green swap completed successfully"
+        cleanup_old_slot
+    else
+        log_error "Traffic switch failed - reverting to ${active_slot}"
+        update_load_balancer_target "${active_slot}"
+    fi
+}
+
+update_load_balancer_target() {
+    local target="$1"
+    # Implementation depends on cloud provider
+    # Example for AWS ALB:
+    # aws elbv2 modify-listener --listener-arn ... --default-actions Type=forward,TargetGroupArn=...-${target}
+    log "INFO" "Load balancer target switched to ${target}"
+}
+
+monitor_traffic_switch() {
+    local target="$1"
+    local start_time=$SECONDS
+    
+    while (( SECONDS - start_time < 300 )); do
+        local error_rate=$(get_current_error_rate "${target}")
+        
+        if (( $(echo "${error_rate} < 1" | bc -l) )); then
+            return 0
+        fi
+        
+        log_warning "Error rate ${error_rate}% during switch - monitoring..."
+        sleep 10
+    done
+    
+    log_error "Traffic switch monitoring timed out"
+    return 1
+}
+
+#-------------------------------------------------------------------------------
+# HELPER FUNCTIONS
+#-------------------------------------------------------------------------------
+cleanup_old_slot() {
+    log "INFO" "Cleaning up old deployment artifacts..."
+    # Remove old containers, prune unused images
+    docker system prune -f
+    log_success "Cleanup completed"
+}
+
+get_current_error_rate() {
+    local slot="$1"
+    # Query Prometheus metrics
+    local error_count=$(curl -s "http://prometheus:9090/api/v1/query" \
+        --data-urlencode "query=sum(rate(api_requests_total{slot=${slot},status_code=~'5..'}[1m]))")
+    # Parse and calculate rate (implementation varies)
+    echo "0.0"
+}
+
+#-------------------------------------------------------------------------------
+# MAIN ENTRY POINT
+#-------------------------------------------------------------------------------
+main() {
+    local command="${1:-deploy}"
+    
+    case "${command}" in
+        deploy)
+            pre_deploy_checks && deploy_with_health_check
+            ;;
+        rollback)
+            rollback
+            ;;
+        blue-green)
+            blue_green_deploy
+            ;;
+        validate)
+            pre_deploy_checks
+            ;;
+        *)
+            echo "Usage: $0 {deploy|rollback|blue-green|validate}"
+            exit 1
+            ;;
+    esac
+}
+
+# Execute main if script is run directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
+```
+
+---
+
+### File 16: `scripts/backup_restore.sh` (Backup & Restore Procedures)
+
+```bash
+#!/bin/bash
+# scripts/backup_restore.sh - Automated Backup and Restoration
+set -euo pipefail
+
+#-------------------------------------------------------------------------------
+# CONFIGURATION
+#-------------------------------------------------------------------------------
+readonly BACKUP_DIR="/mnt/backups/security-audit"
+readonly DB_NAME="security_audit"
+readonly RETENTION_DAYS="${RETENTION_DAYS:-30}"
+readonly COMPRESSION="gzip"
+
+# Encryption key path (store securely!)
+readonly ENCRYPTION_KEY_PATH="/etc/security-audit/backup.key"
+
+#-------------------------------------------------------------------------------
+# UTILITY FUNCTIONS
+#-------------------------------------------------------------------------------
+timestamp() {
+    date -u '+%Y%m%d_%H%M%S'
+}
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a /var/log/security-audit/backup.log
+}
+
+create_backup_directory() {
+    mkdir -p "${BACKUP_DIR}/{database,logs,config,findings}"
+    chmod 700 "${BACKUP_DIR}"
+}
+
+encrypt_file() {
+    local file="$1"
+    if [[ -f "${ENCRYPTION_KEY_PATH}" ]]; then
+        openssl enc -aes-256-cbc -salt -pbkdf2 -in "${file}" \
+            -out "${file}.enc" -pass file:"${ENCRYPTION_KEY_PATH}"
+        rm "${file}"
+        echo "${file}.enc"
+    else
+        log "WARNING" "Encryption key not found - backing up unencrypted"
+        echo "${file}"
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# DATABASE BACKUP
+#-------------------------------------------------------------------------------
+backup_database() {
+    log "INFO" "Starting database backup..."
+    
+    local backup_file="${BACKUP_DIR}/database/db_backup_$(timestamp).sql"
+    local temp_dump=$(mktemp)
+    
+    # PostgreSQL dump
+    PGPASSWORD="${DB_PASSWORD}" pg_dump \
+        --host="${DB_HOST}" \
+        --username="${DB_USER}" \
+        --dbname="${DB_NAME}" \
+        --format=custom \
+        --verbose \
+        --file="${temp_dump}"
+    
+    # Compress and encrypt
+    gzip "${temp_dump}"
+    
+    if [[ "${COMPRESSION}" == "encrypted" ]]; then
+        mv "${temp_dump}.gz" "${backup_file}"
+    else
+        encrypt_file "${backup_file}.gz" || mv "${backup_file}.gz" "${backup_file}"
+    fi
+    
+    log "SUCCESS" "Database backup created: ${backup_file}"
+    
+    # Verify backup integrity
+    if verify_backup "${backup_file}"; then
+        log "SUCCESS" "Backup verification passed"
+    else
+        log "ERROR" "Backup verification failed!"
+        return 1
+    fi
+}
+
+verify_backup() {
+    local backup_file="$1"
+    
+    if [[ -f "${ENCRYPTION_KEY_PATH}" ]] && [[ "${backup_file}" == *.enc ]]; then
+        openssl enc -d -aes-256-cbc -pbkdf2 \
+            -in "${backup_file}" \
+            -out /dev/null \
+            -pass file:"${ENCRYPTION_KEY_PATH}" 2>/dev/null
+    else
+        gunzip -t "${backup_file}" 2>/dev/null
+    fi
+    
+    return $?
+}
+
+#-------------------------------------------------------------------------------
+# FINDINGS EXPORT BACKUP
+#-------------------------------------------------------------------------------
+backup_findings() {
+    log "INFO" "Exporting findings data..."
+    
+    # Export recent findings as JSON
+    python3 <<EOF
+import sqlite3
+import json
+from datetime import datetime, timedelta
+
+conn = sqlite3.connect('/tmp/security_audit.db')
+cursor = conn.cursor()
+
+# Get last 90 days of findings
+cutoff = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
+
+query = '''
+    SELECT f.severity, f.type, f.description, a.timestamp
+    FROM findings f
+    JOIN audit_cycles a ON f.audit_id = a.id
+    WHERE DATE(a.timestamp) >= ?
+'''
+
+cursor.execute(query, (cutoff,))
+rows = cursor.fetchall()
+
+findings_export = []
+for row in rows:
+    findings_export.append({
+        'severity': row[0],
+        'type': row[1],
+        'description': row[2],
+        'timestamp': row[3]
+    })
+
+with open('${BACKUP_DIR}/findings/findings_export_{}.json'.format(timestamp()), 'w') as f:
+    json.dump(findings_export, f, indent=2)
+
+conn.close()
+print(f"Exported {len(findings_export)} findings")
+EOF
+
+    log "SUCCESS" "Findings backup completed"
+}
+
+#-------------------------------------------------------------------------------
+# LOG ARCHIVAL
+#-------------------------------------------------------------------------------
+archive_old_logs() {
+    log "INFO" "Archiving logs older than 30 days..."
+    
+    find /var/log/security-audit \
+        -name "*.log" \
+        -mtime +30 \
+        -exec gzip {} \;
+    
+    # Move archived logs to backup
+    mv /var/log/security-audit/*.log.gz "${BACKUP_DIR}/logs/" 2>/dev/null || true
+    
+    log "SUCCESS" "Log archival completed"
+}
+
+#-------------------------------------------------------------------------------
+# CLEANUP OLD BACKUPS
+#-------------------------------------------------------------------------------
+cleanup_old_backups() {
+    log "INFO" "Removing backups older than ${RETENTION_DAYS} days..."
+    
+    find "${BACKUP_DIR}" \
+        -type f \
+        -mtime +"${RETENTION_DAYS}" \
+        -delete
+    
+    # Report deleted count
+    local deleted_count=$(find "${BACKUP_DIR}" -type f -mtime +"${RETENTION_DAYS}" | wc -l)
+    log "INFO" "Cleaned up ${deleted_count} old backup files"
+}
+
+#-------------------------------------------------------------------------------
+# DATABASE RESTORE
+#-------------------------------------------------------------------------------
+restore_database() {
+    local backup_file="$1"
+    
+    if [[ ! -f "${backup_file}" ]]; then
+        log "ERROR" "Backup file not found: ${backup_file}"
+        return 1
+    fi
+    
+    log "WARNING" "Restoring database from ${backup_file}..."
+    log "WARNING" "This will overwrite all existing data!"
+    
+    read -p "Confirm restoration (yes/no): " confirm
+    if [[ "${confirm}" != "yes" ]]; then
+        log "INFO" "Restoration cancelled"
+        return 0
+    fi
+    
+    # Pre-backup before restore
+    log "INFO" "Creating emergency backup before restore..."
+    backup_database || true
+    
+    # Decrypt if needed
+    local decompressed="${backup_file}"
+    if [[ "${backup_file}" == *.enc ]]; then
+        openssl enc -d -aes-256-cbc -pbkdf2 \
+            -in "${backup_file}" \
+            -out /tmp/restore_temp.sql \
+            -pass file:"${ENCRYPTION_KEY_PATH}"
+        decompressed="/tmp/restore_temp.sql"
+    fi
+    
+    if [[ "${decompressed}" == *.gz ]]; then
+        gunzip -k "${decompressed}"
+        decompressed="${decompressed%.gz}"
+    fi
+    
+    # Perform restore
+    PGPASSWORD="${DB_PASSWORD}" psql \
+        --host="${DB_HOST}" \
+        --username="${DB_USER}" \
+        --dbname="${DB_NAME}" \
+        --file="${decompressed}"
+    
+    log "SUCCESS" "Database restored from ${backup_file}"
+    
+    # Cleanup temp files
+    rm -f /tmp/restore_temp.sql* 2>/dev/null || true
+}
+
+#-------------------------------------------------------------------------------
+# FULL SYSTEM BACKUP
+#-------------------------------------------------------------------------------
+full_system_backup() {
+    log "INFO" "=== STARTING FULL SYSTEM BACKUP ==="
+    
+    create_backup_directory
+    
+    # Sequential execution with error handling
+    backup_database || log "ERROR" "Database backup failed"
+    backup_findings || log "ERROR" "Findings backup failed"
+    archive_old_logs || log "ERROR" "Log archival failed"
+    
+    # Calculate backup size
+    local backup_size=$(du -sh "${BACKUP_DIR}" | cut -f1)
+    log "INFO" "Total backup size: ${backup_size}"
+    
+    # Upload to remote storage (if configured)
+    if [[ -n "${REMOTE_BACKUP_URL:-}" ]]; then
+        upload_to_remote_storage
+    fi
+    
+    cleanup_old_backups
+    
+    log "SUCCESS" "Full system backup completed"
+    log "INFO" "=== BACKUP COMPLETE ==="
+}
+
+upload_to_remote_storage() {
+    log "INFO" "Uploading to remote storage: ${REMOTE_BACKUP_URL}"
+    
+    case "${REMOTE_STORAGE_TYPE}" in
+        s3)
+            aws s3 sync "${BACKUP_DIR}" "${REMOTE_BACKUP_URL}" \
+                --storage-class STANDARD_IA
+            ;;
+        gcs)
+            gsutil -m rsync -r "${BACKUP_DIR}" "${REMOTE_BACKUP_URL}"
+            ;;
+        scp)
+            scp -r "${BACKUP_DIR}/"* "${REMOTE_BACKUP_USER}@${REMOTE_BACKUP_HOST}:${REMOTE_BACKUP_PATH}"
+            ;;
+        *)
+            log "WARNING" "Unknown remote storage type: ${REMOTE_STORAGE_TYPE}"
+            ;;
+    esac
+    
+    log "SUCCESS" "Remote upload completed"
+}
+
+#-------------------------------------------------------------------------------
+# VERIFICATION TEST
+#-------------------------------------------------------------------------------
+test_restore_procedure() {
+    log "INFO" "Testing restore procedure on isolated instance..."
+    
+    # Create test environment
+    local test_db_name="security_audit_test_$(timestamp)"
+    
+    # Restore to test database
+    local latest_backup=$(ls -t "${BACKUP_DIR}/database/"*.gz | head -1)
+    
+    if [[ -z "${latest_backup}" ]]; then
+        log "ERROR" "No backups found for testing"
+        return 1
+    fi
+    
+    # Restore with modified credentials for test
+    PGPASSWORD="${DB_PASSWORD}" psql \
+        --host="${DB_HOST}" \
+        --username="${DB_USER}" \
+        --dbname=postgres \
+        -c "CREATE DATABASE ${test_db_name};"
+    
+    restore_database "${latest_backup}"
+    
+    # Verify data counts
+    local original_count=$(PGPASSWORD="${DB_PASSWORD}" psql \
+        --host="${DB_HOST}" \
+        --username="${DB_USER}" \
+        --dbname="${DB_NAME}" \
+        -t -c "SELECT COUNT(*) FROM findings;")
+    
+    local restored_count=$(PGPASSWORD="${DB_PASSWORD}" psql \
+        --host="${DB_HOST}" \
+        --username="${DB_USER}" \
+        --dbname="${test_db_name}" \
+        -t -c "SELECT COUNT(*) FROM findings;")
+    
+    # Compare
+    if [[ "${original_count}" == "${restored_count}" ]]; then
+        log "SUCCESS" "Restore test passed - data integrity verified"
+    else
+        log "ERROR" "Restore test failed - counts mismatch (${original_count} vs ${restored_count})"
+    fi
+    
+    # Cleanup test database
+    PGPASSWORD="${DB_PASSWORD}" psql \
+        --host="${DB_HOST}" \
+        --username="${DB_USER}" \
+        --dbname=postgres \
+        -c "DROP DATABASE ${test_db_name};"
+}
+
+#-------------------------------------------------------------------------------
+# MAIN
+#-------------------------------------------------------------------------------
+main() {
+    local command="${1:-backup}"
+    
+    case "${command}" in
+        backup|full)
+            full_system_backup
+            ;;
+        restore)
+            if [[ -z "${2:-}" ]]; then
+                echo "Usage: $0 restore <backup_file>"
+                exit 1
+            fi
+            restore_database "$2"
+            ;;
+        verify)
+            if [[ -z "${2:-}" ]]; then
+                echo "Usage: $0 verify <backup_file>"
+                exit 1
+            fi
+            verify_backup "$2"
+            ;;
+        test)
+            test_restore_procedure
+            ;;
+        cleanup)
+            cleanup_old_backups
+            ;;
+        *)
+            cat <<EOF
+Usage: $0 {backup|restore|verify|test|cleanup} [options]
+
+Commands:
+  backup              Full system backup (default)
+  restore <file>      Restore from specified backup file
+  verify <file>       Verify backup integrity
+  test                Test restore procedure
+  cleanup             Remove old backups beyond retention period
+
+Environment Variables:
+  BACKUP_DIR          Directory for storing backups
+  DB_HOST             Database host
+  DB_NAME             Database name
+  DB_USER             Database username
+  DB_PASSWORD         Database password
+  RETENTION_DAYS      Days to retain backups
+  REMOTE_BACKUP_URL   Remote storage URL (optional)
+EOF
+            exit 1
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
+```
+
+---
+
+### File 17: `runbooks/incident_response.md` (Incident Response Playbook)
+
+```markdown
+# Security Audit Platform - Incident Response Runbook
+
+## Document Control
+- **Owner**: Platform Engineering Team
+- **Last Updated**: 2024-10-04
+- **Classification**: Internal
+- **Review Schedule**: Quarterly
+
+---
+
+## Table of Contents
+1. [Incident Classification](#incident-classification)
+2. [Response Procedure](#response-procedure)
+3. [Communication Template](#communication-template)
+4. [Post-Incident Review](#post-incident-review)
+5. [Emergency Contacts](#emergency-contacts)
+
+---
+
+## 1. Incident Classification
+
+### Severity Levels
+
+| Level | Impact | Response Time | Example Scenarios |
+|-------|--------|---------------|-------------------|
+| **P1 - Critical** | Service completely unavailable | < 15 minutes | Complete outage, data breach, RCE exploit |
+| **P2 - High** | Core functionality impaired | < 1 hour | Dashboard down, audit failures, API errors > 50% |
+| **P3 - Medium** | Non-core functionality impaired | < 4 hours | Slower performance, individual features broken |
+| **P4 - Low** | Minor inconvenience | < 24 hours | UI cosmetic issues, documentation errors |
+
+### Automatic Escalation Triggers
+
+```yaml
+P1_triggers:
+  - dashboard_availability < 50%
+  - critical_findings > 10_unresolved
+  - security_breach_confirmed
+  - data_loss_detected
+  - ransomware_indicators
+  
+P2_triggers:
+  - API_error_rate > 10%
+  - audit_failure_rate > 25%
+  - database_connection_failures
+  - notification_service_down
+  
+P3_triggers:
+  - Response_time_p95 > 5_seconds
+  - Single_feature_breakage
+  - Monitoring_alerts_firing
+  
+P4_triggers:
+  - User_reports_minor_issues
+  - Cosmetic_problems
+  - Documentation_errors
+```
+
+---
+
+## 2. Response Procedure
+
+### 2.1 Detection & Triage (First 15 Minutes)
+
+```bash
+# Quick diagnostic commands
+# Run these in order when alert triggers
+
+# 1. Check overall system health
+curl -s https://security-audit.example.com/api/health | jq .
+
+# 2. Check recent error logs
+journalctl -u security-audit -n 100 --since "15 minutes ago"
+
+# 3. Check database connectivity
+pg_isready -h db.internal.example.com -p 5432
+
+# 4. Check disk space
+df -h /var/log/security-audit /var/lib/postgresql
+
+# 5. Check running containers
+docker ps -a --filter "name=security-audit"
+
+# 6. Check Prometheus metrics
+curl -s http://prometheus:9090/api/v1/query \
+  --data-urlencode "query=rate(dashboard_api_requests_total{status_code=~'5..'}[5m])"
+```
+
+### 2.2 Containment Actions
+
+#### Scenario A: Database Performance Issue
+
+```bash
+# 1. Check slow queries
+sudo -u postgres psql -c "SELECT pid, usename, datname, query, state_change \
+  FROM pg_stat_activity \
+  WHERE state = 'active' \
+  AND query_start < NOW() - INTERVAL '5 minutes'"
+
+# 2. Kill problematic connection if necessary
+sudo -u postgres psql -c "SELECT pg_terminate_backend(<pid>)"
+
+# 3. Restart database connection pool
+docker-compose restart app
+```
+
+#### Scenario B: High Memory/CPU Usage
+
+```bash
+# 1. Check container resource usage
+docker stats --no-stream security-audit-dashboard
+
+# 2. Scale horizontally if possible
+docker-compose scale dashboard=3
+
+# 3. If persistent, restart affected service
+docker-compose restart dashboard
+```
+
+#### Scenario C: Security Breach Indicators
+
+```bash
+# 1. IMMEDIATE: Revoke suspicious sessions
+python3 scripts/revoke_sessions.py --pattern "unusual_location"
+
+# 2. Enable emergency rate limiting
+export RATE_LIMIT_MULTIPLIER=10
+docker-compose exec dashboard sed -i 's/rate_limit_requests: .*/rate_limit_requests: 10/' /app/config.py
+
+# 3. Preserve forensic data
+tar czvf /forensics/incident_$(date +%s).tar.gz \
+  /var/log/security-audit \
+  /var/log/auth.log \
+  /var/log/nginx/access.log
+
+# 4. Isolate affected systems
+# Contact SOC team immediately
+```
+
+### 2.3 Resolution & Verification
+
+1. Apply fix following change management procedures
+2. Monitor metrics for 15 minutes minimum
+3. Run smoke tests: `python3 -m scripts.smoke_tests --all`
+4. Verify all dashboards showing healthy status
+5. Clear any false-positive alerts
+
+---
+
+## 3. Communication Template
+
+### Initial Alert Message
+
+```
+🚨 INCIDENT ALERT: [SEVERITY] - [INCIDENT NAME]
+
+Status: INVESTIGATING
+Started: [TIMESTAMP]
+Impact: [DESCRIBE IMPACT]
+
+Affected Services:
+- [List affected components]
+
+Current Status:
+- [Brief description of what's happening]
+- [Actions being taken]
+
+Next Update: [TIME IN 15 MINUTES]
+
+Investigation Lead: [@NAME]
+```
+
+### Status Update Template (Every 30 Minutes)
+
+```
+📊 UPDATE: [INCIDENT NAME] - [SEVERITY]
+
+Time Elapsed: [X] minutes
+
+Current Status:
+[Updated description]
+
+Progress:
+✅ [Completed action]
+🔄 [In-progress action]
+⏳ [Pending action]
+
+Impact Assessment:
+- Users affected: [ESTIMATE]
+- Features impacted: [LIST]
+
+Next Steps:
+- [Action 1]
+- [Action 2]
+
+Next Update: [TIME]
+```
+
+### Resolution Message
+
+```
+✅ RESOLVED: [INCIDENT NAME]
+
+Duration: [X] minutes/hours
+
+Summary:
+[Brief description of incident]
+
+Root Cause:
+[Technical explanation]
+
+Corrective Actions Taken:
+- [Action 1]
+- [Action 2]
+- [Action 3]
+
+Preventive Measures Planned:
+- [Long-term fix 1]
+- [Long-term fix 2]
+
+Post-Incident Review: Scheduled for [DATE]
+Report: [LINK TO DOCUMENT]
+```
+
+---
+
+## 4. Post-Incident Review
+
+### Required Within 48 Hours
+
+1. **Timeline Reconstruction**
+   - Exact start time
+   - All detection points
+   - Every action taken (with timestamps)
+   - Resolution time
+
+2. **Impact Analysis**
+   - User impact quantified
+   - Business impact calculated
+   - Revenue implications (if applicable)
+
+3. **Root Cause Analysis**
+   - Primary cause identified
+   - Contributing factors listed
+   - Why detection was delayed (if applicable)
+
+4. **Action Items**
+   - Short-term fixes (< 1 week)
+   - Long-term improvements (< 1 quarter)
+   - Ownership assigned
+   - Due dates set
+
+### Blameless Retrospective Guidelines
+
+✅ **DO:**
+- Focus on system/process failures
+- Analyze decision-making context
+- Identify learning opportunities
+- Improve monitoring and detection
+- Update runbooks
+
+❌ **DON'T:**
+- Assign individual blame
+- Use "human error" as explanation
+- Skip root cause investigation
+- Ignore systemic issues
+- Rush the review
+
+---
+
+## 5. Emergency Contacts
+
+### On-Call Rotation
+
+| Role | Primary | Secondary | Escalation |
+|------|---------|-----------|------------|
+| **Platform Engineer** | @platform-oncall | @platform-lead | @cto |
+| **Database Admin** | @dba-oncall | @dba-lead | @vp-engineering |
+| **Security Lead** | @security-oncall | @ciso | @ceo |
+| **SRE** | @sre-oncall | @sre-manager | @vp-eng |
+
+### External Contacts
+
+| Organization | Contact | Phone |
+|-------------|---------|-------|
+| **Cloud Provider Support** | AWS Premium | 1-800-XXX-XXXX |
+| **Cyber Insurance** | Policy #XXXXXX | 1-800-YYY-YYYY |
+| **Legal Counsel** | External Firm | +1 (XXX) XXX-XXXX |
+| **PR Crisis Team** | Agency Name | +1 (XXX) XXX-XXXX |
+
+### Communication Channels
+
+- **Slack**: #incident-response
+- **Phone Bridge**: conference.callme.com/security-audit
+- **Email Distribution**: security-audit-incidents@example.com
+
+---
+
+## Appendix A: Common Alert Thresholds
+
+```yaml
+dashboard_monitoring:
+  api_error_rate_threshold: 5%
+  response_time_p95_threshold: 2s
+  availability_threshold: 99.5%
+  
+audit_monitoring:
+  consecutive_failures_threshold: 3
+  finding_spike_threshold: 5x_normal
+  critical_unresolved_threshold: 5
+  
+database_monitoring:
+  connection_pool_exhaustion: 90%
+  replication_lag_threshold: 30s
+  disk_space_threshold: 80%
+  
+infrastructure:
+  cpu_utilization_threshold: 80%
+  memory_utilization_threshold: 85%
+  network_io_anomaly_detection: enabled
+```
+
+---
+
+## Appendix B: Command Reference
+
+```bash
+# Emergency restart sequence
+docker-compose stop dashboard scheduler
+docker-compose rm -f dashboard scheduler
+docker-compose up -d
+
+# Force failover to secondary database
+python3 scripts/database_failover.py --force
+
+# Emergency log collection
+python3 scripts/collect_logs.py --output /tmp/emergency_logs.tar.gz --all
+
+# Disable non-critical features
+export DISABLE_FEATURES="advanced_reporting,historical_trends"
+docker-compose restart dashboard
+```
+
+---
+
+*Document maintained by Platform Engineering. Review quarterly.*
+```
+
+---
+
+### File 18: `terraform/disaster_recovery.tf` (DR Infrastructure)
+
+```hcl
+# terraform/disaster_recovery.tf
+locals {
+  primary_region = "us-east-1"
+  dr_region      = var.dr_region
+  dr_enabled     = var.environment == "prod"
+}
+
+variable "dr_region" {
+  type    = string
+  default = "us-west-2"
+}
+
+# -------------------------------------------------------------------
+# CROSS-REGION DATABASE REPLICATION
+# -------------------------------------------------------------------
+resource "aws_db_instance" "postgres_dr" {
+  count = local.dr_enabled ? 1 : 0
+  
+  identifier = "${local.app_name}-db-dr"
+  
+  engine         = "postgres"
+  engine_version = "15.4"
+  instance_class = "db.t3.medium"  # Smaller for standby
+  
+  # Read replica of primary
+  replicate_source_db = aws_db_instance.postgres.id
+  
+  vpc_security_group_ids = [aws_security_group.rds_dr.id]
+  db_subnet_group_name   = aws_db_subnet_group.dr.name
+  
+  # Optimized for DR scenario
+  publicly_accessible = false
+  delete_automated_backups = false
+  
+  tags = {
+    Name     = "${local.app_name}-database-dr"
+    Role     = "disaster-recovery"
+    Region   = local.dr_region
+  }
+}
+
+# -------------------------------------------------------------------
+# S3 CROSS-REGION REPLICATION
+# -------------------------------------------------------------------
+resource "aws_s3_bucket" "backup_bucket_dr" {
+  count = local.dr_enabled ? 1 : 0
+  
+  bucket = "${local.app_name}-backups-${local.dr_region}"
+  
+  tags = {
+    Name        = "${local.app_name}-backups-dr"
+    Environment = local.environment
+  }
+}
+
+resource "aws_s3_bucket_replication_configuration" "backup_replication" {
+  count = local.dr_enabled ? 1 : 0
+  
+  bucket = aws_s3_bucket.backup_bucket_dr[0].bucket
+  
+  role = aws_iam_role.replication_role.arn
+  
+  rule {
+    id     = "backup-replication"
+    status = "Enabled"
+    
+    filter {
+      prefix = ""
+    }
+    
+    destination {
+      bucket        = aws_s3_bucket.backup_bucket_dr[0].arn
+      storage_class = "STANDARD"
+      
+      encryption_configuration {
+        replica_kms_key_id = aws_kms_key.dr_key[0].arn
+      }
+    }
+  }
+}
+
+# -------------------------------------------------------------------
+# AUTOMATED DR FAILOVER
+# -------------------------------------------------------------------
+resource "aws_lambda_function" "failover_trigger" {
+  count = local.dr_enabled ? 1 : 0
+  
+  function_name = "${local.app_name}-failover-trigger"
+  runtime       = "python3.11"
+  handler       = "lambda_function.handler"
+  role          = aws_iam_role.failover_role.arn
+  timeout       = 300
+  
+  filename         = data.archive_file.lambda.zip.output_path
+  source_code_hash = data.archive_file.lambda.zip.output_base64sha256
+  
+  environment {
+    variables = {
+      PRIMARY_REGION   = local.primary_region
+      DR_REGION        = local.dr_region
+      APP_NAME         = local.app_name
+      SLACK_WEBHOOK    = var.slack_webhook_url
+      PROMOTE_READ_REPLICA = "true"
+    }
+  }
+  
+  tracing_config {
+    mode = "Active"
+  }
+  
+  tags = {
+    Name = "${local.app_name}-failover-trigger"
+  }
+}
+
+# -------------------------------------------------------------------
+# ROUTE 53 FAILOVER DNS
+# -------------------------------------------------------------------
+resource "aws_route53_health_check" "primary" {
+  count = local.dr_enabled ? 1 : 0
+  
+  fqdn              = aws_lb.primary.dns_name
+  port              = 443
+  type              = "HTTPS"
+  resource_path     = "/api/health"
+  failure_threshold = 3
+  request_interval  = 30
+  
+  tags = {
+    Name = "${local.app_name}-primary-health"
+  }
+}
+
+resource "aws_route53_record" "dr_failover" {
+  count = local.dr_enabled ? 1 : 0
+  
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = "security-audit.${var.domain}"
+  type    = "A"
+  
+  failover_routing_policy {
+    type = "SECONDARY"
+  }
+  
+  alias {
+    name                   = aws_lb.dr.dns_name
+    zone_id                = aws_lb.dr.zone_id
+    evaluate_target_health = true
+  }
+  
+  set_identifier  = "dr-endpoint"
+  health_check_id = aws_route53_health_check.dr[0].id
+}
+
+# -------------------------------------------------------------------
+# DATA RETENTION POLICIES
+# -------------------------------------------------------------------
+resource "aws_backup_plan" "security_audit_plan" {
+  name = "${local.app_name}-backup-plan"
+  
+  rule {
+    rule_name         = "daily-backup"
+    target_vault_name = aws_backup_vault.security_audit.name
+    schedule          = "cron(0 2 * * ? *)"  # Daily at 2 AM UTC
+    
+    lifecycle {
+      delete_after = 35
+    }
+    
+    copy_action {
+      destination_vault_arn = aws_backup_vault.dr_backup[0].arn
+      lifecycle {
+        delete_after = 90
+      }
+    }
+  }
+  
+  rule {
+    rule_name         = "monthly-backup"
+    target_vault_name = aws_backup_vault.security_audit.name
+    schedule          = "cron(0 3 1 * ? *)"  # Monthly on 1st
+    
+    lifecycle {
+      delete_after = 365
+    }
+  }
+}
+
+# -------------------------------------------------------------------
+# DR RUNBOOK AUTOMATION
+# -------------------------------------------------------------------
+resource "aws_ssm_document" "dr_runbook" {
+  name          = "${local.app_name}-dr-runbook"
+  document_type = "Command"
+  
+  content = jsonencode({
+    schemaVersion = "2.2",
+    description   = "Disaster Recovery Failover Procedure",
+    parameters = {
+      Action = {
+        type      = "String",
+        default   = "failover",
+        allowedValues = ["failover", "failback", "verify"]
+      }
+    },
+    mainSteps = [
+      {
+        action = "aws:runShellScript",
+        name   = "ExecuteDRProcedure",
+        inputs = {
+          runCommand = [<<-EOF
+#!/bin/bash
+set -euo pipefail
+
+ACTION="${{Action}}"
+
+case "$ACTION" in
+  failover)
+    echo "Initiating failover to ${local.dr_region}..."
+    # Promote read replica
+    aws rds promote-read-replica --db-instance-identifier ${local.app_name}-db-dr
+    
+    # Update Route53
+    aws route53 change-resource-record-sets ...
+    
+    # Notify stakeholders
+    aws lambda invoke --function-name failover-trigger ...
+    ;;
+    
+  failback)
+    echo "Executing failback procedure..."
+    # Reverse process
+    ;;
+    
+  verify)
+    echo "Running DR verification..."
+    # Health checks and data integrity tests
+    ;;
+esac
+EOF
+          ]
+        }
+      }
+    ]
+  }
+}
+```
+
+---
+
+### File 19: `scripts/sla_reporter.py` (SLA Tracking & Reporting)
+
+```python
+#!/usr/bin/env python3
+"""
+SLA Compliance Tracking and Automated Reporting
+Generates monthly SLA reports with actionable insights
+"""
+
+import sqlite3
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Any
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+class SLAMonitor:
+    """Monitor and report on SLA compliance"""
+    
+    def __init__(self, db_path: str = '/tmp/security_audit.db'):
+        self.db_path = db_path
+        self.reporting_period = timedelta(days=30)
+        
+    def calculate_availability(self, days: int = 30) -> float:
+        """Calculate system availability percentage"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        
+        cursor.execute("""
+            SELECT COUNT(*) as total,
+                   SUM(CASE WHEN status = 'healthy' THEN 1 ELSE 0 END) as healthy
+            FROM uptime_logs
+            WHERE timestamp >= ?
+        """, (cutoff,))
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result or result[0] == 0:
+            return 100.0  # Assume healthy if no data
+        
+        return (result[1] / result[0]) * 100
+    
+    def calculate_performance_metrics(self) -> Dict[str, float]:
+        """Calculate performance SLA metrics"""
+        conn = sqlite3.connect(self.db_path)
+        
+        metrics = {
+            'avg_response_time_ms': 0,
+            'p95_response_time_ms': 0,
+            'p99_response_time_ms': 0,
+            'error_rate_percentage': 0
+        }
+        
+        for metric, query in [
+            ('avg_response_time_ms', "SELECT AVG(response_time_ms) FROM api_requests"),
+            ('p95_response_time_ms', "SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms) FROM api_requests"),
+            ('p99_response_time_ms', "SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY response_time_ms) FROM api_requests"),
+            ('error_rate_percentage', """
+                SELECT 
+                    (SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) * 100.0 / COUNT(*))
+                FROM api_requests
+                WHERE timestamp >= datetime('now', '-30 days')
+            """)
+        ]:
+            try:
+                cursor = conn.execute(query)
+                result = cursor.fetchone()[0]
+                metrics[metric] = result or 0
+            except:
+                metrics[metric] = 0
+        
+        conn.close()
+        return metrics
+    
+    def calculate_audit_completion_rate(self) -> float:
+        """Percentage of scheduled audits that completed successfully"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT 
+                (COUNT(*) FILTER (WHERE status = 'completed'))::float * 100 / NULLIF(COUNT(*), 0)
+            FROM scheduled_audits
+            WHERE scheduled_at >= datetime('now', '-30 days')
+        """)
+        
+        result = cursor.fetchone()[0] or 0
+        conn.close()
+        
+        return result
+    
+    def generate_sla_report(self, period_start: datetime = None) -> Dict[str, Any]:
+        """Generate comprehensive SLA report"""
+        if period_start is None:
+            period_start = datetime.now() - self.reporting_period
+        
+        report = {
+            'period': {
+                'start': period_start.isoformat(),
+                'end': datetime.now().isoformat()
+            },
+            'availability': {
+                'percentage': self.calculate_availability(),
+                'target': 99.5,
+                'status': 'compliant' if self.calculate_availability() >= 99.5 else 'breached'
+            },
+            'performance': self.calculate_performance_metrics(),
+            'audit_completion': {
+                'percentage': self.calculate_audit_completion_rate(),
+                'target': 95,
+                'status': 'compliant' if self.calculate_audit_completion_rate() >= 95 else 'at_risk'
+            },
+            'incidents': self._count_incidents(period_start),
+            'recommendations': self._generate_recommendations()
+        }
+        
+        return report
+    
+    def _count_incidents(self, since: datetime) -> Dict[str, int]:
+        """Count incidents by severity in period"""
+        return {
+            'critical': 0,  # Would come from incident tracking table
+            'high': 0,
+            'medium': 0,
+            'low': 0
+        }
+    
+    def _generate_recommendations(self) -> List[str]:
+        """Generate actionable recommendations based on metrics"""
+        recommendations = []
+        
+        if self.calculate_availability() < 99.5:
+            recommendations.append("Increase monitoring coverage to detect downtime faster")
+            recommendations.append("Consider implementing additional redundancy")
+        
+        metrics = self.calculate_performance_metrics()
+        if metrics['p95_response_time_ms'] > 2000:
+            recommendations.append("Optimize slow endpoints - P95 response time exceeding 2s")
+        
+        if metrics['error_rate_percentage'] > 1:
+            recommendations.append("Investigate elevated error rate - consider increased alerting")
+        
+        if self.calculate_audit_completion_rate() < 95:
+            recommendations.append("Review audit scheduling to improve completion rate")
+        
+        return recommendations
+    
+    def export_report(self, report: Dict[str, Any], format: str = 'json') -> str:
+        """Export report in various formats"""
+        if format == 'json':
+            return json.dumps(report, indent=2)
+        elif format == 'html':
+            return self._render_html_report(report)
+        elif format == 'csv':
+            return self._render_csv_summary(report)
+    
+    def _render_html_report(self, report: Dict[str, Any]) -> str:
+        """Render HTML version of SLA report"""
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>SLA Report - {report['period']['start'][:10]}</title></head>
+        <body>
+            <h1>Security Audit Platform - SLA Report</h1>
+            <h2>Period: {report['period']['start'][:10]} to {report['period']['end'][:10]}</h2>
+            
+            <h3>Availability</h3>
+            <p>Status: {report['availability']['status'].upper()}</p>
+            <p>Current: {report['availability']['percentage']:.2f}% | Target: {report['availability']['target']}%</p>
+            
+            <h3>Recommendations</h3>
+            <ul>
+                {''.join([f"<li>{rec}</li>" for rec in report['recommendations']])}
+            </ul>
+        </body>
+        </html>
+        """
+        return html
+    
+    def send_sla_email(self, recipients: List[str], report: Dict[str, Any]):
+        """Email SLA report to stakeholders"""
+        msg = MIMEMultipart()
+        msg['Subject'] = f'SLA Report - {report["period"]["start"][:10]}'
+        msg['From'] = 'sla-reports@example.com'
+        msg['To'] = ', '.join(recipients)
+        
+        body = f"""
+        Monthly SLA Report
+        
+        Period: {report['period']['start'][:10]} to {report['period']['end'][:10]}
+        
+        Availability: {report['availability']['percentage']:.2f}%
+        Status: {report['availability']['status'].upper()}
+        
+        Incidents: {sum(report['incidents'].values())}
+        
+        Recommendations:
+        {'\n'.join(['- ' + rec for rec in report['recommendations']])}
+        
+        Full report attached.
+        """
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Attach full report
+        attachment = MIMEText(json.dumps(report, indent=2), 'json')
+        attachment.add_header('Content-Disposition', 'attachment', filename=f'sla_{report["period"]["start"][:10]}.json')
+        msg.attach(attachment)
+        
+        with smtplib.SMTP('smtp.example.com', 587) as server:
+            server.starttls()
+            server.login('reports@example.com', 'password')
+            server.send_message(msg)
+
+
+def main():
+    """CLI interface for SLA reporting"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='SLA Compliance Reporter')
+    parser.add_argument('--format', choices=['json', 'html', 'csv'], default='json')
+    parser.add_argument('--send-email', action='store_true')
+    parser.add_argument('--recipients', nargs='+', default=[])
+    parser.add_argument('--period-days', type=int, default=30)
+    
+    args = parser.parse_args()
+    
+    monitor = SLAMonitor()
+    report = monitor.generate_sla_report()
+    
+    # Output report
+    print(monitor.export_report(report, args.format))
+    
+    # Email if requested
+    if args.send_email and args.recipients:
+        monitor.send_sla_email(args.recipients, report)
+        print("\nReport sent via email")
+
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+### File 20: `docs/runbooks/database_maintenance.md` (Database Maintenance Procedures)
+
+```markdown
+# Database Maintenance Runbook
+
+## Overview
+This document outlines procedures for maintaining the PostgreSQL database supporting the Security Audit Platform.
+
+---
+
+## Scheduled Maintenance Windows
+
+| Day | Window | Duration | Tasks |
+|-----|--------|----------|-------|
+| Sunday | 02:00-04:00 UTC | 2 hours | Full vacuum, statistics update |
+| Wednesday | 03:00-03:30 UTC | 30 min | Index rebuild (non-blocking) |
+| Monthly | 1st Sunday 02:00 UTC | Variable | Full backup verification |
+
+---
+
+## Maintenance Procedures
+
+### Vacuum & Statistics Update
+
+```bash
+# Run during maintenance window
+sudo -u postgres psql -c "ANALYZE;"
+sudo -u postgres psql -c "VACUUM ANALYZE findings;"
+sudo -u postgres psql -c "VACUUM ANALYZE audit_cycles;"
+```
+
+### Index Rebuild (Non-blocking)
+
+```sql
+-- For PostgreSQL 12+, use CONCURRENTLY
+REINDEX INDEX CONCURRENTLY idx_findings_severity;
+REINDEX INDEX CONCURRENTLY idx_audit_timestamp;
+
+-- For larger indexes, monitor progress
+SELECT relname, indexrelname, pg_size_pretty(pg_relation_size(indexrelid))
+FROM pg_indexes
+JOIN pg_class ON pg_class.oid = pg_indexes.indexrelid
+WHERE schemaname = 'public';
+```
+
+### Connection Pool Tuning
+
+```sql
+-- Check current connections
+SELECT count(*) FROM pg_stat_activity WHERE datname = 'security_audit';
+
+-- Adjust max_connections if needed (requires restart)
+ALTER SYSTEM SET max_connections = 200;
+SELECT pg_reload_conf();
+```
+
+### Bloat Check
+
+```sql
+-- Check table bloat
+SELECT 
+    schemaname || '.' || relname AS table,
+    pg_size_pretty(n_live_tup * avg_width) AS estimated_row_size,
+    n_dead_tup AS dead_tuples,
+    CASE 
+        WHEN n_live_tup > 0 THEN round(100 * n_dead_tup / n_live_tup, 2)
+        ELSE 0
+    END AS dead_tuple_pct
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC;
+```
+
+### Partition Maintenance
+
+```sql
+-- For partitioned tables, detach old partitions
+ALTER TABLE audit_cycles DETACH PARTITION audit_cycles_2023_01;
+
+-- Archive to cold storage
+INSERT INTO audit_cycles_archive SELECT * FROM audit_cycles_2023_01;
+DROP TABLE audit_cycles_2023_01;
+```
+
+---
+
+## Emergency Procedures
+
+### Connection Exhaustion
+
+```bash
+# Find blocking queries
+SELECT pid, usename, wait_event_type, state, query
+FROM pg_stat_activity
+WHERE state != 'idle'
+ORDER BY state_change;
+
+# Kill idle-in-transaction sessions
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+AND query_start < NOW() - INTERVAL '30 minutes';
+```
+
+### Replication Lag
+
+```sql
+-- Check replication lag
+SELECT 
+    application_name,
+    state,
+    pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)/1024/1024 AS lag_mb
+FROM pg_stat_replication;
+
+-- If lag > 100MB, investigate
+-- Check disk I/O, network bandwidth
+```
+
+### Disk Space Emergency
+
+```bash
+# Quick space analysis
+du -sh /var/lib/postgresql/*/base/* | sort -hr | head -10
+
+# Vacuum large tables immediately
+sudo -u postgres psql -c "VACUUM FULL audit_cycles;"
+
+# Delete old backups (after verifying elsewhere)
+find /var/lib/postgresql/backups -mtime +30 -delete
+```
+
+---
+
+## Monitoring Commands
+
+### Real-time Query Monitoring
+
+```sql
+-- Enable logging of slow queries
+ALTER SYSTEM SET log_min_duration_statement = 1000;  -- 1 second
+SELECT pg_reload_conf();
+
+-- View currently running queries
+SELECT 
+    pid,
+    now() - query_start AS duration,
+    state,
+    substring(query, 1, 50) AS query_preview
+FROM pg_stat_activity
+WHERE state != 'idle'
+ORDER BY duration DESC;
+```
+
+---
+
+## Checklist Before Each Deployment
+
+- [ ] Backup database
+- [ ] Run VACUUM ANALYZE
+- [ ] Check disk space (> 20% free)
+- [ ] Review slow query log
+- [ ] Verify connection pool health
+- [ ] Test restore from backup
+- [ ] Document any changes made
+
+---
+
+*Last reviewed: 2024-10-04*
+*Maintainer: Platform Engineering Team*
+```
+
+---
+
+## Summary: Phase 7 Deliverables
+
+| Category | Deliverable | Purpose |
+|----------|-------------|---------|
+| **Deployment** | `deploy.sh` | Automated deployment with health checks |
+| **Deployment** | Blue-green deployment | Zero-downtime releases |
+| **Backup** | `backup_restore.sh` | Comprehensive backup automation |
+| **Backup** | Encrypted backups | Secure data protection |
+| **Recovery** | `incident_response.md` | Step-by-step incident procedures |
+| **Recovery** | SLA reporter | Compliance tracking & reporting |
+| **Infra** | DR Terraform | Multi-region disaster recovery |
+| **Maintenance** | DB runbooks | Ongoing database upkeep |
+
+---
+
+### Deployment Workflow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      DEPLOYMENT LIFECYCLE                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐        │
+│  │ Pre-Deps │───▶│ Deploy   │───▶│ Health   │───▶│ Smoke    │        │
+│  │ Checks   │    │ Scripts  │    │ Checks   │    │ Tests    │        │
+│  └──────────┘    └──────────┘    └──────────┘    └──────────┘        │
+│        │                │              │              │            │
+│        │                ▼              │              ▼            │
+│        │         ┌──────────┐         │      ┌──────────┐         │
+│        │         │  Rollback│◀────────┤      │ Record   │         │
+│        │         │  (if fail)│         │      │  Event   │         │
+│        │         └──────────┘         │      └──────────┘         │
+│        │                             │                          │
+│        ▼                             ▼                          │
+│  ┌──────────┐                   ┌──────────┐                    │
+│  │ Validate │                   │  Notify  │                    │
+│  │ Secrets  │                   │  Team    │                    │
+│  └──────────┘                   └──────────┘                    │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Key Metrics to Track
+
+| Metric | Target | Alert Threshold |
+|--------|--------|-----------------|
+| Deployment Success Rate | > 99% | < 95% |
+| Average Deployment Time | < 10 min | > 20 min |
+| Rollback Frequency | < 5%/month | > 10%/month |
+| Backup Success Rate | 100% | < 99.5% |
+| RTO (Recovery Time) | < 1 hour | > 2 hours |
+| RPO (Data Loss) | < 5 minutes | > 15 minutes |
