@@ -1,0 +1,2 @@
+git -C ~/pixel-terminal-master diff --exit-code
+git -C ~/pixel-terminal-master tag "pre-pixel-$(date +%Y%m%d-%H%M%S)"

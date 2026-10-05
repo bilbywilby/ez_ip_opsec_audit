@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# ------------------------------------------------------------------
+# handover_info.sh – collect all environment data for Pixel‑Terminal
+# ------------------------------------------------------------------
+
+OUT=~/handshake_report.txt
+: > "$OUT"                     # truncate old file
+
+# 1. Termux / Android basics
+{
+  echo "=== termux-info ==="
+  termux-info
+  echo -e "\n=== termux-version ==="
+  termux-version
+  echo -e "\n=== Android build ==="
+  getprop ro.build.version.release
+  getprop ro.build.version.sdk
+  getprop ro.product.manufacturer
+  getprop ro.product.model
+} >> "$OUT"
+
+# 2. Installed packages (focus on our stack)
+{
+  echo -e "\n=== installed packages (termux) ==="
+  apt list --installed | grep -E 'termux|git|python|tmux|coreutils'
+} >> "$OUT"
+
+# 3. Our scripts & permissions
+{
+  echo -e "\n=== pixel_heartbeat.sh (size/perm) ==="
+  ls -l ~/pixel_heartbeat.sh
+  echo -e "\n=== launch_pixel_immortal.sh (size/perm) ==="
+  ls -l ~/launch_pixel_immortal.sh
+  echo -e "\n=== master.sh (size/perm) ==="
+  ls -l ~/pixel-terminal-master/master.sh
+} >> "$OUT"
+
+# 4. Running processes (filter our app)
+{
+  echo -e "\n=== processes related to master.sh ==="
+  ps -f | grep -i master.sh | grep -v grep
+  echo -e "\n=== heartbeat process ==="
+  pgrep -fl pixel_heartbeat.sh || echo "none"
+} >> "$OUT"
+
+# 5. tmux session list (if any)
+{
+  echo -e "\n=== tmux sessions ==="
+  tmux ls 2>/dev/null || echo "no tmux sessions"
+} >> "$OUT"
+
+# 6. Resource limits
+{
+  echo -e "\n=== ulimit -a ==="
+  ulimit -a
+} >> "$OUT"
+
+# 7. System logs that might hint at OOM / signal kills
+{
+  echo -e "\n=== dmesg (last 50 lines) ==="
+  dmesg | tail -n 50
+} >> "$OUT"
+
+# 8. Git status of the project (if present)
+{
+  echo -e "\n=== git status (pixel-terminal-master) ==="
+  (cd ~/pixel-terminal-master && git status -sb) || echo "not a git repo"
+} >> "$OUT"
+
+# 9. Heartbeat file content (last timestamp)
+{
+  echo -e "\n=== .heartbeat file (if exists) ==="
+  cat ~/pixel-terminal-master/.heartbeat 2>/dev/null || echo "no .heartbeat"
+} >> "$OUT"
+
+# 10. Environment variables that affect signals / sessions
+{
+  echo -e "\n=== relevant environment vars ==="
+  env | grep -iE 'TMUX|TERM|PATH|HOME'
+} >> "$OUT"
+
+# Summary line
+echo -e "\n--- END OF REPORT ---" >> "$OUT"
+
+echo "✅ Info collected in $OUT"

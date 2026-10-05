@@ -1,0 +1,377 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}</style><style>:root{color-scheme:light dark;--md-bg:#fff;--md-text:rgba(0,0,0,.8);--md-muted:rgba(0,0,0,.6);--md-fill:rgba(0,0,0,.04);--md-fill-strong:rgba(0,0,0,.06);--md-rule:rgba(0,0,0,.1);--md-rule-strong:rgba(0,0,0,.16);--md-link:hsl(210 100% 45%)}@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])){--md-bg:#0d0d0d;--md-text:rgba(255,255,255,.85);--md-muted:rgba(255,255,255,.6);--md-fill:rgba(255,255,255,.06);--md-fill-strong:rgba(255,255,255,.09);--md-rule:rgba(255,255,255,.14);--md-rule-strong:rgba(255,255,255,.22);--md-link:hsl(210 100% 72%)}}:root[data-theme="dark"]{color-scheme:dark;--md-bg:#0d0d0d;--md-text:rgba(255,255,255,.85);--md-muted:rgba(255,255,255,.6);--md-fill:rgba(255,255,255,.06);--md-fill-strong:rgba(255,255,255,.09);--md-rule:rgba(255,255,255,.14);--md-rule-strong:rgba(255,255,255,.22);--md-link:hsl(210 100% 72%)}:root[data-theme="light"]{color-scheme:light}@media print{:root,:root[data-theme="dark"]{color-scheme:light;--md-bg:#fff;--md-text:rgba(0,0,0,.8);--md-muted:rgba(0,0,0,.6);--md-fill:rgba(0,0,0,.04);--md-fill-strong:rgba(0,0,0,.06);--md-rule:rgba(0,0,0,.1);--md-rule-strong:rgba(0,0,0,.16);--md-link:hsl(210 100% 45%)}}body{background:var(--md-bg);color:var(--md-text);max-width:720px;margin:0 auto;padding:32px;display:flex;flex-direction:column;gap:10px;font:14px/1.55 -apple-system,BlinkMacSystemFont,'SF Pro','Segoe UI',sans-serif;overflow-wrap:break-word}body>:first-child{margin-top:0}h1,h2,h3,h4,h5,h6{margin:6px 0 0;line-height:1.25;font-weight:600;text-wrap:balance}h1{font-size:1.35em}h2{font-size:1.15em;color:var(--md-muted)}h3,h4,h5,h6{font-size:1em}p,ul,ol,blockquote,table,pre,hr{margin:0}strong{font-weight:600}a{color:var(--md-link);text-decoration:none}a:hover{text-decoration:underline}ul,ol{display:flex;flex-direction:column;gap:6px;padding-left:22px}ul{list-style:disc}ol{list-style:decimal}:is(li,td,th)>*+:is(p,ul,ol,blockquote){margin-top:6px}blockquote{display:flex;flex-direction:column;gap:10px;border-left:2px solid var(--md-rule);padding-left:10px;color:var(--md-muted)}:not(pre)>code{background:var(--md-fill);padding:1px 3px;border-radius:4px;font:.92em 'SF Mono',ui-monospace,Menlo,Consolas,monospace}a>code{background:none;color:inherit}pre{background:var(--md-fill);padding:10px 12px;border-radius:6px;overflow-x:auto;font:12px/1.5 'SF Mono',ui-monospace,Menlo,Consolas,monospace;margin-block:4px}pre code{background:none;padding:0;font:inherit}table{width:100%;border-collapse:separate;border-spacing:2px;font:inherit}th,td{padding:6px 8px;border-radius:3px;text-align:left;vertical-align:top}th{background:var(--md-fill-strong);font-weight:600}td{background:var(--md-fill)}:is(th,td) :not(pre)>code{background:transparent}hr{border:0;border-top:1px solid var(--md-rule-strong);margin-block:10px}img{max-width:100%;height:auto;border-radius:4px}</style>
+</head><body>
+<h1>Incident Response (continued) and Disaster Recovery</h1>
+<p>Continues <code>runbooks/incident_response.md</code> from Scenario C, step 4.
+Last updated: 2026-10-04</p>
+<hr>
+<h2>2.2 Containment (continued)</h2>
+<h3>Scenario C: Security breach indicators (replaces steps 2-4)</h3>
+<pre><code class="language-bash"># 2. Emergency rate limiting: set via env, restart. Do NOT sed config files in a live container.
+#    (config.py reads env; add RATE_LIMIT_REQUESTS to SecurityConfig if missing)
+RATE_LIMIT_REQUESTS=10 docker compose up -d --no-deps dashboard
+
+# 3. Rotate JWT secret (invalidates ALL sessions)
+NEW=$(python3 -c &#34;import secrets; print(secrets.token_hex(32))&#34;)
+#    update JWT_SECRET_KEY in your secret store, then:
+docker compose up -d --no-deps dashboard scheduler
+
+# 4. Preserve forensic data BEFORE any cleanup
+mkdir -p /forensics &amp;&amp; chmod 700 /forensics
+tar czf /forensics/incident_$(date -u +%Y%m%dT%H%M%SZ).tar.gz \
+  /var/log/security-audit /var/log/auth.log /var/log/nginx/access.log
+sha256sum /forensics/incident_*.tar.gz &gt; /forensics/SHA256SUMS
+
+# 5. Isolate: remove public ingress (security group / firewall), keep SSH from admin CIDR only
+# 6. Notify security lead and start the incident log (section 3)
+</code></pre>
+<p>Do not wipe, rebuild, or <code>docker system prune</code> until forensics are archived.</p>
+<h3>Scenario D: Failed deployment</h3>
+<pre><code class="language-bash">./scripts/deploy.sh rollback
+curl -sf https://security-audit.example.com/api/health | jq .
+</code></pre>
+<p>If rollback fails, restore from last backup (Section 6) and page the on-call.</p>
+<h3>Scenario E: Notification pipeline down</h3>
+<ol>
+<li>Check Slack webhook / SMTP credentials (<code>journalctl -u scheduler | grep -i notif</code>).</li>
+<li>Fall back to manual paging. Confirm critical findings via <code>/api/findings?severity=CRITICAL</code>.</li>
+<li>Open P2 until alerts verified end-to-end.</li>
+</ol>
+<hr>
+<h2>3. Communication Templates</h2>
+<p><strong>Initial notice (within SLA)</strong></p>
+<pre><code>[P&lt;level&gt;] &lt;short title&gt;
+Status: Investigating
+Impact: &lt;who/what is affected&gt;
+Started: &lt;UTC time&gt;
+Next update: &lt;UTC time, max 30 min for P1, 60 for P2&gt;
+Incident lead: &lt;name&gt;
+</code></pre>
+<p><strong>Update</strong></p>
+<pre><code>[P&lt;level&gt;] &lt;title&gt; - Update &lt;n&gt;
+Status: Investigating | Identified | Mitigating | Monitoring
+Findings: &lt;what we know&gt;
+Actions: &lt;what is in progress&gt;
+Next update: &lt;UTC time&gt;
+</code></pre>
+<p><strong>Resolution</strong></p>
+<pre><code>[P&lt;level&gt;] &lt;title&gt; - Resolved
+Duration: &lt;start&gt; to &lt;end&gt; UTC
+Root cause (preliminary): &lt;one line&gt;
+Follow-up: postmortem within 5 business days
+</code></pre>
+<p>If personal data may be exposed, loop in legal/compliance immediately; notification deadlines (e.g. GDPR 72h) start at awareness.</p>
+<hr>
+<h2>4. Post-Incident Review</h2>
+<p>Blameless. Complete within 5 business days of P1/P2.</p>
+<table>
+<thead>
+<tr>
+<th>Section</th>
+<th>Content</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Summary</td>
+<td>What happened, impact, duration</td>
+</tr>
+<tr>
+<td>Timeline</td>
+<td>UTC timestamps: detection, triage, mitigation, resolution</td>
+</tr>
+<tr>
+<td>Root cause</td>
+<td>5-whys; technical and process</td>
+</tr>
+<tr>
+<td>Detection</td>
+<td>Did alerts fire? How long to notice?</td>
+</tr>
+<tr>
+<td>What went well / poorly</td>
+<td>Specific, not general</td>
+</tr>
+<tr>
+<td>Action items</td>
+<td>Owner + due date + ticket, each</td>
+</tr>
+</tbody>
+</table>
+<p>Track action items to closure; review open ones at the quarterly runbook review.</p>
+<hr>
+<h2>5. Emergency Contacts</h2>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Name</th>
+<th>Contact</th>
+<th>Escalate after</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>On-call engineer</td>
+<td>TBD</td>
+<td>TBD</td>
+<td>immediate</td>
+</tr>
+<tr>
+<td>Incident lead</td>
+<td>TBD</td>
+<td>TBD</td>
+<td>15 min (P1)</td>
+</tr>
+<tr>
+<td>Security lead</td>
+<td>TBD</td>
+<td>TBD</td>
+<td>any breach indicator</td>
+</tr>
+<tr>
+<td>Cloud provider support</td>
+<td>n/a</td>
+<td>support portal</td>
+<td>infra failure</td>
+</tr>
+</tbody>
+</table>
+<p>Fill these in before go-live. A runbook with blank contacts is not a runbook.</p>
+<hr>
+<h2>6. Disaster Recovery</h2>
+<h3>6.1 Objectives</h3>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Component</th>
+<th>RPO</th>
+<th>RTO</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Database (findings, audit cycles)</td>
+<td>24h from logical dumps alone; ~5 min only with RDS automated backups or WAL archiving (see 6.4a)</td>
+<td>2h</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Dashboard + scheduler</td>
+<td>n/a (stateless)</td>
+<td>1h</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Logs / audit artifacts</td>
+<td>24h</td>
+<td>8h</td>
+</tr>
+</tbody>
+</table>
+<p><code>pg_dump</code>/<code>pg_restore</code> is logical and restores to the moment of the dump only. It cannot give point-in-time recovery. PITR needs a physical base backup plus continuous WAL archiving (RDS automated backups do this for you). Without one of those, the RPO is 24h.</p>
+<h3>6.2 What is backed up</h3>
+<ul>
+<li>PostgreSQL dump (<code>pg_dump --format=custom</code>), encrypted</li>
+<li>Findings JSON export (90 days)</li>
+<li>Archived logs</li>
+<li>Config and secrets: <strong>in your secret manager, not in backups</strong></li>
+<li>Terraform state: S3 with versioning on</li>
+</ul>
+<h3>6.3 Disaster scenarios</h3>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>Recovery path</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single container/host failure</td>
+<td>Restart; ASG/compose <code>restart: unless-stopped</code></td>
+</tr>
+<tr>
+<td>Database corruption</td>
+<td>PITR to just before the corruption (6.4a), or restore latest dump (6.4) and accept loss since the dump</td>
+</tr>
+<tr>
+<td>Region/AZ outage</td>
+<td>Re-apply Terraform in alternate region, restore DB from cross-region backup copy</td>
+</tr>
+<tr>
+<td>Ransomware / compromise</td>
+<td>Treat as breach (Scenario C). Rebuild from clean images, restore DB from a backup that predates compromise, rotate every secret</td>
+</tr>
+<tr>
+<td>Accidental deletion</td>
+<td>Restore from backup; for repo, <code>git reflog</code> / remote</td>
+</tr>
+</tbody>
+</table>
+<h3>6.4 Database restore</h3>
+<p>Backups are created with <code>pg_dump --format=custom</code>, so restore with <code>pg_restore</code>, not <code>psql</code>.</p>
+<pre><code class="language-bash"># 1. Pick and verify backup
+ls -t /mnt/backups/security-audit/database/ | head
+openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/etc/security-audit/backup.key \
+  -in &lt;backup&gt;.gz.enc -out /tmp/restore.dump.gz
+gunzip /tmp/restore.dump.gz
+
+# 2. Restore into a NEW database first
+createdb -h &#34;$DB_HOST&#34; -U &#34;$DB_USER&#34; security_audit_restore
+pg_restore -h &#34;$DB_HOST&#34; -U &#34;$DB_USER&#34; -d security_audit_restore --no-owner /tmp/restore.dump
+
+# 3. Sanity check
+psql -h &#34;$DB_HOST&#34; -U &#34;$DB_USER&#34; -d security_audit_restore \
+  -c &#34;SELECT COUNT(*) FROM audit_cycles; SELECT COUNT(*) FROM findings;&#34;
+
+# 4. Cut over: stop app, rename databases, start app
+docker compose stop dashboard scheduler
+psql -h &#34;$DB_HOST&#34; -U &#34;$DB_USER&#34; -d postgres -c \
+  &#34;ALTER DATABASE security_audit RENAME TO security_audit_old; \
+   ALTER DATABASE security_audit_restore RENAME TO security_audit;&#34;
+docker compose up -d
+
+# 5. Verify
+curl -sf https://security-audit.example.com/api/status | jq .
+shred -u /tmp/restore.dump
+</code></pre>
+<p>Keep <code>security_audit_old</code> until the incident is closed.</p>
+<h3>6.4a Point-in-time recovery (RDS)</h3>
+<p>Production DB is RDS (<code>main.tf</code>). PITR needs automated backups on (<code>backup_retention_period</code> &gt;= 1; Terraform sets 7 for prod, 1 otherwise). <code>pg_dump</code> cannot do PITR.</p>
+<pre><code class="language-bash"># Read-only preflight: checks source, retention window, target time; prints the command
+./scripts/restore_db_rds.sh --target-time 2026-10-04T12:00:00Z --dry-run
+
+# Restore into a NEW private instance (asks for confirmation)
+./scripts/restore_db_rds.sh --target-time 2026-10-04T12:00:00Z
+</code></pre>
+<p>The script never touches the source instance, Terraform state, or running containers. Afterwards:</p>
+<ol>
+<li>Validate row counts on the new endpoint.</li>
+<li>Update the DB URL in the secret manager, then restart dashboard and scheduler.</li>
+<li>Keep the old instance until the incident is closed.</li>
+<li>Reconcile Terraform deliberately (import or rename). Never from a restore script.</li>
+</ol>
+<p>If Postgres also runs as a Compose service, this section does not cover it. Remove the <code>db</code> service from <code>docker compose.yml</code> so the two cannot diverge.</p>
+<h3>6.5 Full rebuild (host/region loss)</h3>
+<p><strong>Region loss prerequisite:</strong> PITR cannot cross regions and a dead region takes its automated backups with it. Replicated backups must already exist:</p>
+<pre><code class="language-bash"># Run in the DR region, ahead of time
+aws rds start-db-instance-automated-backups-replication --region &lt;DR_REGION&gt; \
+  --source-db-instance-arn &lt;source instance ARN&gt; --backup-retention-period 7
+# add --kms-key-id &lt;key in DR region&gt; if the source is encrypted
+</code></pre>
+<p>Without this, the database RPO for a region loss is the last off-region copy of a dump.</p>
+<ol>
+<li><code>cd terraform &amp;&amp; terraform init &amp;&amp; terraform apply -var environment=prod -var aws_region=&lt;DR_REGION&gt;</code>. This also creates an empty RDS instance; delete it once the restored one is up.</li>
+<li>Restore the database from the replicated backup:
+<pre><code class="language-bash">aws rds restore-db-instance-to-point-in-time --region &lt;DR_REGION&gt; \
+  --source-db-instance-automated-backups-arn &lt;replicated backups ARN&gt; \
+  --target-db-instance-identifier security-audit-dr-$(date -u +%Y%m%d) \
+  --use-latest-restorable-time --no-publicly-accessible \
+  --db-subnet-group-name &lt;subnet group&gt; --vpc-security-group-ids &lt;sg ids&gt;
+</code></pre>
+Same-region host loss: use <code>./scripts/restore_db_rds.sh</code> instead.</li>
+<li>Put the new DB URL in the secret manager, then <code>DEPLOY_ENV=production ./scripts/deploy.sh deploy</code>.</li>
+<li>Re-point DNS (lower TTL to 60s in advance if you can).</li>
+<li>Confirm Prometheus targets are up and alerts route to Slack/email.</li>
+</ol>
+<h3>6.6 Testing schedule</h3>
+<table>
+<thead>
+<tr>
+<th>Test</th>
+<th>Frequency</th>
+<th>Pass criteria</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Backup verification (<code>backup_restore.sh verify</code>)</td>
+<td>Daily (automated)</td>
+<td>Exit 0</td>
+</tr>
+<tr>
+<td>Restore to scratch DB</td>
+<td>Monthly</td>
+<td>Row counts match</td>
+</tr>
+<tr>
+<td>Fresh-clone + deploy to staging</td>
+<td>Quarterly</td>
+<td>Health check green, &lt; RTO</td>
+</tr>
+<tr>
+<td>Full DR game day</td>
+<td>Annually</td>
+<td>Tier 1 restored within RTO</td>
+</tr>
+<tr>
+<td>Runbook review</td>
+<td>Quarterly</td>
+<td>Contacts valid, commands run</td>
+</tr>
+</tbody>
+</table>
+<p>An untested backup is a hope, not a backup. Log every drill result in <code>.audit_logs/dr_drills.md</code>.</p>
+<h3>6.7 Retention</h3>
+<table>
+<thead>
+<tr>
+<th>Data</th>
+<th>Retention</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Daily DB backups</td>
+<td>30 days</td>
+</tr>
+<tr>
+<td>Monthly DB backups</td>
+<td>12 months</td>
+</tr>
+<tr>
+<td>Audit logs</td>
+<td>90 days hot, 1 year archive</td>
+</tr>
+<tr>
+<td>Forensic bundles</td>
+<td>Until incident closed + 1 year</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2>7. Maintenance Calendar</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Cadence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dependency scan review</td>
+<td>Weekly (CI cron)</td>
+</tr>
+<tr>
+<td>Rotate JWT secret, SMTP, DB creds</td>
+<td>Quarterly</td>
+</tr>
+<tr>
+<td>Patch base images</td>
+<td>Monthly</td>
+</tr>
+<tr>
+<td>Review alert thresholds</td>
+<td>Quarterly</td>
+</tr>
+<tr>
+<td>Capacity review (disk, DB size)</td>
+<td>Monthly</td>
+</tr>
+</tbody>
+</table>
+
+</body></html>
